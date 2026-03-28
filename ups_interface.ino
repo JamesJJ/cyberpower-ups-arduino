@@ -690,7 +690,7 @@ void setup() {
 #endif
 
 #ifdef CH3819_OTA_H
-  ch3819_ota_setup(CH3819_OTA_HOST, CH3819_OTA_PORT, __DATE__, __TIME__, "ups-monitor", 600000, nullptr);
+  ch3819_ota_setup(CH3819_OTA_HOST, CH3819_OTA_PORT, __DATE__, __TIME__, "ups-monitor", 3600000, nullptr);
 #endif
 
   server.on("/ups", handle_ups);
@@ -730,13 +730,21 @@ void loop() {
     xSemaphoreGive(g_ups_mutex);
   }
 
-  // DS18B20: read result and request next conversion every 2s
+  // DS18B20: Request temperatures. Check for conversion in each loop after the request and update g_temp_c when conversion has completed.
+  // Wait 10s before requesting temperatures again.
+  static bool tempRequested = true;  // already requested in setup()
   static uint32_t last_temp = 0;
-  if (tempFound && millis() - last_temp >= 30000) {
-    last_temp = millis();
-    float t = tempSensor.getTempC(tempAddr);
-    if (t != DEVICE_DISCONNECTED_C) g_temp_c = t;
-    tempSensor.requestTemperatures();
+  if (tempFound && millis() - last_temp >= 10000) {
+    if (tempRequested && tempSensor.isConversionComplete()) {
+      float t = tempSensor.getTempC(tempAddr);
+      if (t != DEVICE_DISCONNECTED_C) g_temp_c = t;
+      last_temp = millis();
+      tempRequested = false;
+    }
+    if (!tempRequested) {
+      tempSensor.requestTemperatures();
+      tempRequested = true;
+    }
   }
 
   // Display cycle — always runs regardless of UPS connection.
@@ -756,11 +764,17 @@ void loop() {
   //  12: IP octet 4
   //  13: off  → restart
   static uint32_t disp_start = 0;
-  static uint32_t last_phase = 99;
+  static uint32_t last_disp_refresh = 0;
+  static uint32_t phase = 0;
 
-  uint32_t phase = (millis() - disp_start) / 1800;
-  if (phase != last_phase) {
-    last_phase = phase;
+  if (millis() - disp_start > 2000) {
+    disp_start = millis();
+    phase++;
+    if (phase > 99) phase = 0;
+  }
+
+  if (millis() - last_disp_refresh > 400) {
+    last_disp_refresh = millis();
 
     xSemaphoreTake(g_ups_mutex, portMAX_DELAY);
     UpsData d = g_ups;
@@ -768,31 +782,53 @@ void loop() {
 
     // Segment encodings
     const uint8_t seg_ups[] = { 0x3E, 0x73, 0x6D, 0x00 };
-    const uint8_t seg_none[] = { 0x37, 0x3F, 0x37, 0x79 };
     const uint8_t ip_ind[] = { 0x01, 0x09, 0x49, 0x63 };
+    const uint8_t seg_usb[] = { 0x00, 0x3E, 0x6D, 0x7C };
+    const uint8_t seg_err[] = { 0x00, 0x79, 0x50, 0x50 };
+    //const uint8_t seg_none[] = { 0x37, 0x3F, 0x37, 0x79 };
 
     bool wifi_ok = WiFi.status() == WL_CONNECTED;
 
-    switch (phase % 15) {
-      case 0: show_word(g_dev_ready ? seg_ups : seg_none); break;
+    switch (phase) {
+      case 0:
+        {
+          if (g_dev_ready) {
+            show_word(seg_ups);
+          } else {
+            show_word((millis() / 400) % 2 ? seg_err : seg_usb);
+          }
+          break;
+        }
       case 1:
         if (d.valid) show_metric(SEG_VOLT, (int)(d.battery_voltage * 10));
-        else disp_off();
+        else {
+          disp_off();
+          phase += 2;
+        }
         break;
       case 2: disp_off(); break;
       case 3:
         if (d.valid) show_metric(SEG_WATT, (int)d.ups_realpower);
-        else disp_off();
+        else {
+          disp_off();
+          phase += 2;
+        }
         break;
       case 4: disp_off(); break;
       case 5:
         if (g_temp_c > -127.0) show_metric(SEG_TEMP, (int)(g_temp_c * 10));
-        else disp_off();
+        else {
+          disp_off();
+          phase += 2;
+        }
         break;
       case 6: disp_off(); break;
       case 7:
         if (wifi_ok) show_metric(SEG_RSSI, WiFi.RSSI());
-        else disp_off();
+        else {
+          disp_off();
+          phase += 2;
+        }
         break;
       case 8: disp_off(); break;
       case 9:  // fall through
@@ -800,7 +836,7 @@ void loop() {
       case 11:
       case 12:
         {
-          int i = phase % 14 - 9;
+          int i = (phase - 9) % 4;
           if (wifi_ok) show_metric(ip_ind[i], WiFi.localIP()[i]);
           else {
             const uint8_t no_wifi[] = { ip_ind[i], 0x10, 0x10, 0x10 };
@@ -810,8 +846,7 @@ void loop() {
         break;
       case 13: disp_off(); break;
       case 14:
-        disp_start = millis();
-        last_phase = 99;
+        phase = 0;
         break;
     }
   }
@@ -825,7 +860,7 @@ void loop() {
     colon_on_at = 0;
   }
 
-  disp_flush();
+  if (millis() > 4000) disp_flush();
 
   if (millis() - took_a_break_at > 5) {
     delay(1);
