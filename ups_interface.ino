@@ -718,7 +718,7 @@ void loop() {
 
   server.handleClient();
 
-  // Poll UPS every 5s; clear data if stale for 60s
+  // Poll UPS every 1s; clear data if stale for 60s
   static uint32_t last_poll = 0;
   if (millis() - last_poll >= 1000) {
     last_poll = millis();
@@ -767,13 +767,13 @@ void loop() {
   static uint32_t last_disp_refresh = 0;
   static uint32_t phase = 0;
 
-  if (millis() - disp_start > 2000) {
+  if (millis() - disp_start > 2160) {
     disp_start = millis();
     phase++;
     if (phase > 99) phase = 0;
   }
 
-  if (millis() - last_disp_refresh > 400) {
+  if (millis() - last_disp_refresh > 360) {
     last_disp_refresh = millis();
 
     xSemaphoreTake(g_ups_mutex, portMAX_DELAY);
