@@ -1,3 +1,4 @@
+
 /*
  * CyberPower UPS HID host → WiFi JSON HTTP server
  * Target: XIAO ESP32S3 (hwcdc default, USB OTG host)
@@ -14,6 +15,11 @@
  *
  */
 
+/* ########### THIS IS THE PUBLIC VERSION ########### */
+/* https://github.com/JamesJJ/cyberpower-ups-arduino  */
+/* ################################################## */
+
+
 #include "Arduino.h"
 #include "WiFi.h"
 #include "WebServer.h"
@@ -25,15 +31,19 @@
 #include "freertos/semphr.h"
 #include "usb/usb_host.h"
 
-#include "CH3819_WiFi_PRIVATE.h"
+/*  ----------- DISABLE THESE 3 "CH3819_" INCLUDES (unless you are JamesJJ) ------------- */
+// #include <CH3819_PRIVATE.h>
+// #include <CH3819_WIFI.h>
+// #include <CH3819_OTA.h>
+/* ------------------------------------------------------------ */
 
-#ifdef CH3819_WiFi_SSID
-  #define WIFI_SSID CH3819_WiFi_SSID
-  #define WIFI_PASS CH3819_WiFi_KEY
+#ifdef CH3819_PRIVATE_H
+#define WIFI_SSID CH3819_WiFi_SSID
+#define WIFI_PASS CH3819_WiFi_KEY
 #else
-  #define WIFI_SSID "" // REMEMBER TO SET YOUR WIFI DETAILS HERE
-  #define WIFI_PASS ""
-#endif 
+#define WIFI_SSID "" /* --- REMEMBER TO SET YOUR WIFI DETAILS HERE ---- */
+#define WIFI_PASS ""
+#endif
 
 // TM1637 pins (XIAO ESP32S3: D9=GPIO8, D10=GPIO9)
 #define TM_CLK D9
@@ -44,11 +54,11 @@
 
 // Leftmost digit segment indicators for each metric
 // Segments: a=0x01 b=0x02 c=0x04 d=0x08 e=0x10 f=0x20 g=0x40
-#define SEG_VOLT 0x7C // b-shape → voltage
-#define SEG_WATT 0x73 // p-shape → watts
-#define SEG_STAT 0x6D // S-shape → status
-#define SEG_RSSI 0x4F // 3-shape (w on it's side ^^) → Wifi RSSI
-#define SEG_TEMP 0x58 // small c (lower half) → temperature in C
+#define SEG_VOLT 0x7C  // b-shape → voltage
+#define SEG_WATT 0x73  // p-shape → watts
+#define SEG_STAT 0x6D  // S-shape → status
+#define SEG_RSSI 0x4F  // 3-shape (w on it's side ^^) → Wifi RSSI
+#define SEG_TEMP 0x58  // small c (lower half) → temperature in C
 
 static TM1637Display disp(TM_CLK, TM_DIO);
 
@@ -98,15 +108,15 @@ struct UpsData {
 static UpsData g_ups = {};
 static SemaphoreHandle_t g_ups_mutex;
 static WebServer server(80);
-static uint32_t took_a_break_at = 0; // millis() timestamp of last delay/yield (the the processor sleep and not get hot
-static uint32_t colon_on_at = 0; // millis() timestamp of last HTTP request, for colon flash
-static uint32_t ac_lost_at = 0;  // millis() when ac_present last became false
-static uint32_t ac_back_at = 0;  // millis() when ac_present last became true
+static uint32_t took_a_break_at = 0;  // millis() timestamp of last delay/yield (the the processor sleep and not get hot
+static uint32_t colon_on_at = 0;      // millis() timestamp of last HTTP request, for colon flash
+static uint32_t ac_lost_at = 0;       // millis() when ac_present last became false
+static uint32_t ac_back_at = 0;       // millis() when ac_present last became true
 
 // ── AC presence tracking over 300s window ─────────────────────────────────────
-#define AC_HIST_WINDOW_S  300
-#define AC_HIST_SLOTS     300   // 1 slot per second
-static uint8_t  ac_hist[AC_HIST_SLOTS];  // 1 = ac present, 0 = not
+#define AC_HIST_WINDOW_S 300
+#define AC_HIST_SLOTS 300               // 1 slot per second
+static uint8_t ac_hist[AC_HIST_SLOTS];  // 1 = ac present, 0 = not
 static uint16_t ac_hist_idx = 0;
 static uint32_t ac_hist_last_ms = 0;
 static uint16_t ac_hist_count = 0;  // how many slots filled so far
@@ -131,22 +141,22 @@ static float ac_hist_pct() {
   for (uint16_t i = 0; i < ac_hist_count; i++) sum += ac_hist[i];
   return 100.0f * sum / ac_hist_count;
 }
-static float g_temp_c = -127.0;  // last DS18B20 reading, -127 = invalid
-static volatile uint32_t g_last_poll_ok = 0; // millis() of last successful poll
+static float g_temp_c = -127.0;               // last DS18B20 reading, -127 = invalid
+static volatile uint32_t g_last_poll_ok = 0;  // millis() of last successful poll
 
 // ── Display state (desired vs actual) ─────────────────────────────────────────
 static struct {
   uint8_t desired[4];
   uint8_t actual[4];
-  bool    desired_on;
-  bool    actual_on;
-} dstate = { {}, {}, false, true }; // mismatch on boot forces initial push
+  bool desired_on;
+  bool actual_on;
+} dstate = { {}, {}, false, true };  // mismatch on boot forces initial push
 
 // ── USB host state ────────────────────────────────────────────────────────────
 static usb_host_client_handle_t g_client = NULL;
-static usb_device_handle_t      g_dev    = NULL;
-static uint8_t                  g_itf    = 0;
-static volatile bool            g_dev_ready = false;
+static usb_device_handle_t g_dev = NULL;
+static uint8_t g_itf = 0;
+static volatile bool g_dev_ready = false;
 
 // ── Decode helpers ────────────────────────────────────────────────────────────
 static uint32_t le_uint(const uint8_t *b, int off, int len) {
@@ -165,22 +175,40 @@ static const char *beeper_str(uint8_t v) {
   }
 }
 static float freq_index(uint8_t i) {
-  switch (i) { case 1: case 4: case 5: return 50; case 2: case 3: case 6: return 60; default: return 0; }
+  switch (i) {
+    case 1:
+    case 4:
+    case 5: return 50;
+    case 2:
+    case 3:
+    case 6: return 60;
+    default: return 0;
+  }
 }
 static float freq_nom(uint8_t i) {
-  switch (i) { case 1: case 4: return 50; case 2: case 3: return 60; default: return 0; }
+  switch (i) {
+    case 1:
+    case 4: return 50;
+    case 2:
+    case 3: return 60;
+    default: return 0;
+  }
 }
 static float volt_nom(uint8_t i) {
-  const float m[] = {0,100,110,120,200,208,220,230,240};
+  const float m[] = { 0, 100, 110, 120, 200, 208, 220, 230, 240 };
   return (i < 9) ? m[i] : 0;
 }
 static float batt_volt_nom(uint8_t i) {
-  const float m[] = {0,12,24,36,48,72,96,108,120,144};
+  const float m[] = { 0, 12, 24, 36, 48, 72, 96, 108, 120, 144 };
   return (i < 10) ? m[i] : 0;
 }
 
 // ── Synchronous HID GET_FEATURE_REPORT via control transfer ───────────────────
-struct XferCtx { SemaphoreHandle_t sem; esp_err_t result; uint8_t *buf; };
+struct XferCtx {
+  SemaphoreHandle_t sem;
+  esp_err_t result;
+  uint8_t *buf;
+};
 
 static void xfer_cb(usb_transfer_t *t) {
   XferCtx *ctx = (XferCtx *)t->context;
@@ -198,24 +226,24 @@ static bool get_feature_report(uint8_t rid, uint8_t *out, uint16_t len) {
   if (usb_host_transfer_alloc(8 + len, 0, &t) != ESP_OK) return false;
 
   // Build HID GET_FEATURE_REPORT setup packet
-  t->data_buffer[0] = 0xA1; // bmRequestType: D→H, Class, Interface
-  t->data_buffer[1] = 0x01; // bRequest: GET_REPORT
+  t->data_buffer[0] = 0xA1;  // bmRequestType: D→H, Class, Interface
+  t->data_buffer[1] = 0x01;  // bRequest: GET_REPORT
   t->data_buffer[2] = rid;
-  t->data_buffer[3] = 0x03; // report type: Feature
-  t->data_buffer[4] = 0;    // wIndex lo = interface number
-  t->data_buffer[5] = 0;    // wIndex hi
+  t->data_buffer[3] = 0x03;  // report type: Feature
+  t->data_buffer[4] = 0;     // wIndex lo = interface number
+  t->data_buffer[5] = 0;     // wIndex hi
   t->data_buffer[6] = (uint8_t)(len & 0xFF);
   t->data_buffer[7] = (uint8_t)(len >> 8);
 
   uint8_t tmp[64] = {};
   XferCtx ctx = { xSemaphoreCreateBinary(), ESP_FAIL, tmp };
 
-  t->num_bytes      = 8 + len;
-  t->device_handle  = g_dev;
-  t->bEndpointAddress = 0; // control EP
-  t->callback       = xfer_cb;
-  t->context        = &ctx;
-  t->timeout_ms     = 200;
+  t->num_bytes = 8 + len;
+  t->device_handle = g_dev;
+  t->bEndpointAddress = 0;  // control EP
+  t->callback = xfer_cb;
+  t->context = &ctx;
+  t->timeout_ms = 200;
 
   bool ok = false;
   if (usb_host_transfer_submit_control(g_client, t) == ESP_OK) {
@@ -231,15 +259,15 @@ static bool get_feature_report(uint8_t rid, uint8_t *out, uint16_t len) {
 
 // ── Poll and decode all UPS fields ───────────────────────────────────────────
 // Bitmask positions for each polled report ID
-#define RID_BATTERY   (1 << 0)  // 0x08
-#define RID_BATCFG    (1 << 1)  // 0x07
-#define RID_BATVOLT   (1 << 2)  // 0x0a
-#define RID_INPUTV    (1 << 3)  // 0x0f
-#define RID_INPUTF    (1 << 4)  // 0x0e
-#define RID_STATUS    (1 << 5)  // 0x0b
+#define RID_BATTERY (1 << 0)    // 0x08
+#define RID_BATCFG (1 << 1)     // 0x07
+#define RID_BATVOLT (1 << 2)    // 0x0a
+#define RID_INPUTV (1 << 3)     // 0x0f
+#define RID_INPUTF (1 << 4)     // 0x0e
+#define RID_STATUS (1 << 5)     // 0x0b
 #define RID_REALPOWER (1 << 6)  // 0x19
-#define RID_APPARENT  (1 << 7)  // 0x1d
-#define RID_REQUIRED  (RID_BATTERY | RID_STATUS | RID_REALPOWER)
+#define RID_APPARENT (1 << 7)   // 0x1d
+#define RID_REQUIRED (RID_BATTERY | RID_STATUS | RID_REALPOWER)
 
 static uint32_t g_poll_ok_mask = 0;
 // RIDs found in HID report descriptor
@@ -257,7 +285,8 @@ static const uint8_t known_rids[] = {
 };
 
 static bool is_known_rid(uint8_t rid) {
-  for (uint8_t k : known_rids) if (k == rid) return true;
+  for (uint8_t k : known_rids)
+    if (k == rid) return true;
   return false;
 }
 
@@ -270,11 +299,11 @@ static void parse_hid_report_descriptor() {
   const uint16_t max_len = 512;
   if (usb_host_transfer_alloc(8 + max_len, 0, &t) != ESP_OK) return;
 
-  t->data_buffer[0] = 0x81; // bmRequestType: D→H, Standard, Interface
-  t->data_buffer[1] = 0x06; // bRequest: GET_DESCRIPTOR
-  t->data_buffer[2] = 0x00; // wValue lo: descriptor index 0
-  t->data_buffer[3] = 0x22; // wValue hi: HID Report descriptor type
-  t->data_buffer[4] = g_itf; // wIndex lo: interface number
+  t->data_buffer[0] = 0x81;   // bmRequestType: D→H, Standard, Interface
+  t->data_buffer[1] = 0x06;   // bRequest: GET_DESCRIPTOR
+  t->data_buffer[2] = 0x00;   // wValue lo: descriptor index 0
+  t->data_buffer[3] = 0x22;   // wValue hi: HID Report descriptor type
+  t->data_buffer[4] = g_itf;  // wIndex lo: interface number
   t->data_buffer[5] = 0;
   t->data_buffer[6] = (uint8_t)(max_len & 0xFF);
   t->data_buffer[7] = (uint8_t)(max_len >> 8);
@@ -282,17 +311,17 @@ static void parse_hid_report_descriptor() {
   uint8_t desc_buf[512] = {};
   XferCtx ctx = { xSemaphoreCreateBinary(), ESP_FAIL, desc_buf };
 
-  t->num_bytes      = 8 + max_len;
-  t->device_handle  = g_dev;
+  t->num_bytes = 8 + max_len;
+  t->device_handle = g_dev;
   t->bEndpointAddress = 0;
-  t->callback       = xfer_cb;
-  t->context        = &ctx;
-  t->timeout_ms     = 500;
+  t->callback = xfer_cb;
+  t->context = &ctx;
+  t->timeout_ms = 500;
 
   bool ok = false;
   uint16_t desc_len = 0;
   if (usb_host_transfer_submit_control(g_client, t) == ESP_OK) {
-    if (xSemaphoreTake(ctx.sem, pdMS_TO_TICKS(600)) == pdTRUE && ctx.result == ESP_OK)  {
+    if (xSemaphoreTake(ctx.sem, pdMS_TO_TICKS(600)) == pdTRUE && ctx.result == ESP_OK) {
       ok = true;
       desc_len = t->actual_num_bytes > 8 ? t->actual_num_bytes - 8 : 0;
     }
@@ -307,13 +336,13 @@ static void parse_hid_report_descriptor() {
   uint16_t i = 0;
   while (i < desc_len && g_desc_rid_count < sizeof(g_desc_rids)) {
     uint8_t prefix = desc_buf[i];
-    if (prefix == 0xFE) { // long item
+    if (prefix == 0xFE) {  // long item
       if (i + 2 >= desc_len) break;
       i += 3 + desc_buf[i + 1];
       continue;
     }
     uint8_t sz = prefix & 0x03;
-    if (sz == 3) sz = 4; // size encoding: 0,1,2,4
+    if (sz == 3) sz = 4;  // size encoding: 0,1,2,4
     if (prefix == 0x85 && sz == 1 && i + 1 < desc_len) {
       g_desc_rids[g_desc_rid_count++] = desc_buf[i + 1];
     }
@@ -347,46 +376,59 @@ static void poll_ups() {
   }
 
   if (rd(0x08)) {
-    d.battery_charge        = le_uint(buf, 1, 1);
-    d.battery_runtime_s     = le_uint(buf, 2, 2);
+    d.battery_charge = le_uint(buf, 1, 1);
+    d.battery_runtime_s = le_uint(buf, 2, 2);
     d.battery_runtime_low_s = le_uint(buf, 4, 2);
     mask |= RID_BATTERY;
   }
   if (rd(0x07)) {
     d.battery_charge_warning = le_uint(buf, 4, 1);
-    d.battery_charge_low     = le_uint(buf, 5, 1);
+    d.battery_charge_low = le_uint(buf, 5, 1);
     mask |= RID_BATCFG;
   }
-  if (rd(0x0a)) { d.battery_voltage = le_uint(buf, 1, 2) * 0.1f; mask |= RID_BATVOLT; }
-  if (rd(0x1a)) d.battery_voltage_nominal   = batt_volt_nom(le_uint(buf, 1, 1));
-  if (rd(0x0f)) { d.input_voltage = le_uint(buf, 1, 2); mask |= RID_INPUTV; }
-  if (rd(0x0c)) d.input_voltage_nominal     = volt_nom(le_uint(buf, 1, 1));
-  if (rd(0x0d)) d.input_frequency_nominal   = freq_nom(le_uint(buf, 1, 1));
-  if (rd(0x0e)) { d.input_frequency = le_uint(buf, 1, 1) * 0.5f; mask |= RID_INPUTF; }
-  if (rd(0x10)) d.input_transfer_low        = le_uint(buf, 1, 2);
-  if (rd(0x12)) d.output_voltage            = le_uint(buf, 1, 2);
-  if (rd(0x13)) d.output_voltage_nominal    = volt_nom(le_uint(buf, 1, 1));
-  if (rd(0x14)) d.output_frequency          = freq_index(le_uint(buf, 1, 1));
+  if (rd(0x0a)) {
+    d.battery_voltage = le_uint(buf, 1, 2) * 0.1f;
+    mask |= RID_BATVOLT;
+  }
+  if (rd(0x1a)) d.battery_voltage_nominal = batt_volt_nom(le_uint(buf, 1, 1));
+  if (rd(0x0f)) {
+    d.input_voltage = le_uint(buf, 1, 2);
+    mask |= RID_INPUTV;
+  }
+  if (rd(0x0c)) d.input_voltage_nominal = volt_nom(le_uint(buf, 1, 1));
+  if (rd(0x0d)) d.input_frequency_nominal = freq_nom(le_uint(buf, 1, 1));
+  if (rd(0x0e)) {
+    d.input_frequency = le_uint(buf, 1, 1) * 0.5f;
+    mask |= RID_INPUTF;
+  }
+  if (rd(0x10)) d.input_transfer_low = le_uint(buf, 1, 2);
+  if (rd(0x12)) d.output_voltage = le_uint(buf, 1, 2);
+  if (rd(0x13)) d.output_voltage_nominal = volt_nom(le_uint(buf, 1, 1));
+  if (rd(0x14)) d.output_frequency = freq_index(le_uint(buf, 1, 1));
   if (rd(0x19)) {
     d.ups_realpower = le_uint(buf, 1, 2);
     mask |= RID_REALPOWER;
     if (rd(0x18)) {
       d.ups_realpower_nominal = le_uint(buf, 1, 2);
       d.ups_load = d.ups_realpower_nominal > 0
-                   ? d.ups_realpower / d.ups_realpower_nominal * 100.0f : 0;
+                     ? d.ups_realpower / d.ups_realpower_nominal * 100.0f
+                     : 0;
     }
   }
   if (rd(0x18)) d.ups_realpower_nominal = le_uint(buf, 1, 2);
-  if (rd(0x1d)) { d.ups_apparent_power = le_uint(buf, 1, 2); mask |= RID_APPARENT; }
-  if (rd(0x1b)) d.ups_beeper_status     = beeper_str(le_uint(buf, 1, 1));
+  if (rd(0x1d)) {
+    d.ups_apparent_power = le_uint(buf, 1, 2);
+    mask |= RID_APPARENT;
+  }
+  if (rd(0x1b)) d.ups_beeper_status = beeper_str(le_uint(buf, 1, 1));
   if (rd(0x0b)) {
     uint8_t s = le_uint(buf, 1, 1);
-    d.ups_status_raw        = s;
-    d.ac_present            = s & (1 << 0);
-    d.charging              = s & (1 << 1);
-    d.discharging           = s & (1 << 2);
-    d.low_battery           = s & (1 << 3);
-    d.fully_charged         = s & (1 << 4);
+    d.ups_status_raw = s;
+    d.ac_present = s & (1 << 0);
+    d.charging = s & (1 << 1);
+    d.discharging = s & (1 << 2);
+    d.low_battery = s & (1 << 3);
+    d.fully_charged = s & (1 << 4);
     d.runtime_limit_expired = s & (1 << 5);
     mask |= RID_STATUS;
   }
@@ -400,7 +442,7 @@ static void poll_ups() {
   xSemaphoreTake(g_ups_mutex, portMAX_DELAY);
   if (g_ups.valid && d.ac_present != g_ups.ac_present) {
     if (d.ac_present) ac_back_at = millis();
-    else              ac_lost_at = millis();
+    else ac_lost_at = millis();
   }
   g_ups = d;
   g_last_poll_ok = millis();
@@ -414,45 +456,46 @@ static void usb_host_task(void *) {
   ESP_ERROR_CHECK(usb_host_install(&cfg));
 
   usb_host_client_config_t ccfg = {
-    .is_synchronous    = false,
+    .is_synchronous = false,
     .max_num_event_msg = 5,
     .async = { .client_event_callback = [](const usb_host_client_event_msg_t *msg, void *) {
-      if (msg->event == USB_HOST_CLIENT_EVENT_NEW_DEV) {
-        uint8_t addr = msg->new_dev.address;
-        usb_device_handle_t dev;
-        if (usb_host_device_open(g_client, addr, &dev) != ESP_OK) return;
-        const usb_device_desc_t *desc;
-        usb_host_get_device_descriptor(dev, &desc);
-        if (desc->idVendor == UPS_VID && desc->idProduct == UPS_PID) {
-          // Claim first HID interface (interface 0)
-          const usb_config_desc_t *cfg_desc;
-          usb_host_get_active_config_descriptor(dev, &cfg_desc);
-          // Find first HID interface number
-          int offset = 0;
-          const usb_intf_desc_t *intf = usb_parse_interface_descriptor(cfg_desc, 0, 0, &offset);
-          if (intf && usb_host_interface_claim(g_client, dev, intf->bInterfaceNumber, 0) == ESP_OK) {
-            g_itf = intf->bInterfaceNumber;
-            g_dev = dev;
-            g_dev_ready = true;
-          }
-        } else {
-          usb_host_device_close(g_client, dev);
-        }
-      } else if (msg->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
-        if (g_dev) {
-          g_dev_ready = false;
-          g_rid_scan_done = false;
-          g_desc_rid_count = 0;
-          memset(g_rid_responds, 0, sizeof(g_rid_responds));
-          xSemaphoreTake(g_ups_mutex, portMAX_DELAY);
-          g_ups = {};
-          xSemaphoreGive(g_ups_mutex);
-          usb_host_interface_release(g_client, g_dev, g_itf);
-          usb_host_device_close(g_client, g_dev);
-          g_dev = NULL;
-        }
-      }
-    }, .callback_arg = NULL }
+                if (msg->event == USB_HOST_CLIENT_EVENT_NEW_DEV) {
+                  uint8_t addr = msg->new_dev.address;
+                  usb_device_handle_t dev;
+                  if (usb_host_device_open(g_client, addr, &dev) != ESP_OK) return;
+                  const usb_device_desc_t *desc;
+                  usb_host_get_device_descriptor(dev, &desc);
+                  if (desc->idVendor == UPS_VID && desc->idProduct == UPS_PID) {
+                    // Claim first HID interface (interface 0)
+                    const usb_config_desc_t *cfg_desc;
+                    usb_host_get_active_config_descriptor(dev, &cfg_desc);
+                    // Find first HID interface number
+                    int offset = 0;
+                    const usb_intf_desc_t *intf = usb_parse_interface_descriptor(cfg_desc, 0, 0, &offset);
+                    if (intf && usb_host_interface_claim(g_client, dev, intf->bInterfaceNumber, 0) == ESP_OK) {
+                      g_itf = intf->bInterfaceNumber;
+                      g_dev = dev;
+                      g_dev_ready = true;
+                    }
+                  } else {
+                    usb_host_device_close(g_client, dev);
+                  }
+                } else if (msg->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
+                  if (g_dev) {
+                    g_dev_ready = false;
+                    g_rid_scan_done = false;
+                    g_desc_rid_count = 0;
+                    memset(g_rid_responds, 0, sizeof(g_rid_responds));
+                    xSemaphoreTake(g_ups_mutex, portMAX_DELAY);
+                    g_ups = {};
+                    xSemaphoreGive(g_ups_mutex);
+                    usb_host_interface_release(g_client, g_dev, g_itf);
+                    usb_host_device_close(g_client, g_dev);
+                    g_dev = NULL;
+                  }
+                }
+              },
+               .callback_arg = NULL }
   };
   ESP_ERROR_CHECK(usb_host_client_register(&ccfg, &g_client));
 
@@ -465,8 +508,7 @@ static void usb_host_task(void *) {
 // ── Display helpers ───────────────────────────────────────────────────────────
 // Push desired state to hardware when it differs from actual
 static void disp_flush() {
-  if (dstate.desired_on == dstate.actual_on &&
-      memcmp(dstate.desired, dstate.actual, 4) == 0) return;
+  if (dstate.desired_on == dstate.actual_on && memcmp(dstate.desired, dstate.actual, 4) == 0) return;
   if (!dstate.desired_on) {
     disp.clear();
     memset(dstate.actual, 0, 4);
@@ -489,12 +531,20 @@ static void show_word(const uint8_t segs[4]) {
 static void encode_number(int value) {
   bool neg = value < 0;
   unsigned v = neg ? -value : value;
-  uint8_t d[3] = {0, 0, disp.encodeDigit(v % 10)};
+  uint8_t d[3] = { 0, 0, disp.encodeDigit(v % 10) };
   v /= 10;
-  if (v) { d[1] = disp.encodeDigit(v % 10); v /= 10; }
+  if (v) {
+    d[1] = disp.encodeDigit(v % 10);
+    v /= 10;
+  }
   if (v) d[0] = disp.encodeDigit(v % 10);
-  if (neg) { // put minus in leftmost non-blank position
-    for (int i = 0; i < 3; i++) { if (!d[i]) { d[i] = 0x40; break; } }
+  if (neg) {  // put minus in leftmost non-blank position
+    for (int i = 0; i < 3; i++) {
+      if (!d[i]) {
+        d[i] = 0x40;
+        break;
+      }
+    }
   }
   memcpy(&dstate.desired[1], d, 3);
 }
@@ -513,7 +563,7 @@ static void disp_off() {
 
 // ── HTTP handler ──────────────────────────────────────────────────────────────
 static void handle_ups() {
-  colon_on_at = millis(); // triggers colon flash in loop
+  colon_on_at = millis();  // triggers colon flash in loop
 
   xSemaphoreTake(g_ups_mutex, portMAX_DELAY);
   UpsData d = g_ups;
@@ -521,67 +571,66 @@ static void handle_ups() {
 
   char json[900];
   snprintf(json, sizeof(json),
-    "{"
-    "\"ups_connected\":%s,"
-    "\"battery_charge_pct\":%.0f,"
-    "\"battery_charge_low_pct\":%.0f,"
-    "\"battery_charge_warning_pct\":%.0f,"
-    "\"battery_runtime_s\":%lu,"
-    "\"battery_runtime_low_s\":%lu,"
-    "\"battery_voltage_v\":%.1f,"
-    "\"input_voltage_v\":%.0f,"
-    "\"input_frequency_hz\":%.1f,"
-    "\"input_transfer_low_v\":%.0f,"
-    "\"output_voltage_v\":%.0f,"
-    "\"output_frequency_hz\":%.0f,"
-    "\"ups_realpower_w\":%.0f,"
-    "\"ups_apparent_power_va\":%.0f,"
-    "\"ups_load_pct\":%.1f,"
-    "\"ups_beeper_status\":\"%s\","
-    "\"ups_status_raw\":%u,"
-    "\"ac_present\":%s,"
-    "\"charging\":%s,"
-    "\"discharging\":%s,"
-    "\"low_battery\":%s,"
-    "\"fully_charged\":%s,"
-    "\"runtime_limit_expired\":%s,"
-    "\"ups_delay_shutdown_s\":%lu,"
-    "\"uptime_ms\":%lu,"
-    "\"wifi_rssi_dbm\":%d,"
-    "\"ac_lost_at_ms\":%lu,"
-    "\"ac_back_at_ms\":%lu,"
-    "\"temperature_c\":%.1f,"
-    "\"ups_update_ms\":%lu,"
-    "\"poll_ok_mask\":\"0x%02lx\","
-    "\"ac_present_pct_300s\":%.1f"
-    "}",
-    d.valid ? "true" : "false",
-    d.battery_charge, d.battery_charge_low, d.battery_charge_warning,
-    d.battery_runtime_s, d.battery_runtime_low_s,
-    d.battery_voltage,
-    d.input_voltage,
-    d.input_frequency,
-    d.input_transfer_low,
-    d.output_voltage, d.output_frequency,
-    d.ups_realpower, d.ups_apparent_power,
-    d.ups_load, d.ups_beeper_status ? d.ups_beeper_status : "unknown",
-    d.ups_status_raw,
-    d.ac_present ? "true" : "false",
-    d.charging ? "true" : "false",
-    d.discharging ? "true" : "false",
-    d.low_battery ? "true" : "false",
-    d.fully_charged ? "true" : "false",
-    d.runtime_limit_expired ? "true" : "false",
-    d.ups_delay_shutdown_s,
-    millis(),
-    WiFi.RSSI(),
-    ac_lost_at,
-    ac_back_at,
-    g_temp_c,
-    g_last_poll_ok,
-    (unsigned long)g_poll_ok_mask,
-    ac_hist_pct()
-  );
+           "{"
+           "\"ups_connected\":%s,"
+           "\"battery_charge_pct\":%.0f,"
+           "\"battery_charge_low_pct\":%.0f,"
+           "\"battery_charge_warning_pct\":%.0f,"
+           "\"battery_runtime_s\":%lu,"
+           "\"battery_runtime_low_s\":%lu,"
+           "\"battery_voltage_v\":%.1f,"
+           "\"input_voltage_v\":%.0f,"
+           "\"input_frequency_hz\":%.1f,"
+           "\"input_transfer_low_v\":%.0f,"
+           "\"output_voltage_v\":%.0f,"
+           "\"output_frequency_hz\":%.0f,"
+           "\"ups_realpower_w\":%.0f,"
+           "\"ups_apparent_power_va\":%.0f,"
+           "\"ups_load_pct\":%.1f,"
+           "\"ups_beeper_status\":\"%s\","
+           "\"ups_status_raw\":%u,"
+           "\"ac_present\":%s,"
+           "\"charging\":%s,"
+           "\"discharging\":%s,"
+           "\"low_battery\":%s,"
+           "\"fully_charged\":%s,"
+           "\"runtime_limit_expired\":%s,"
+           "\"ups_delay_shutdown_s\":%lu,"
+           "\"uptime_ms\":%lu,"
+           "\"wifi_rssi_dbm\":%d,"
+           "\"ac_lost_at_ms\":%lu,"
+           "\"ac_back_at_ms\":%lu,"
+           "\"temperature_c\":%.1f,"
+           "\"ups_update_ms\":%lu,"
+           "\"poll_ok_mask\":\"0x%02lx\","
+           "\"ac_present_pct_300s\":%.1f"
+           "}",
+           d.valid ? "true" : "false",
+           d.battery_charge, d.battery_charge_low, d.battery_charge_warning,
+           d.battery_runtime_s, d.battery_runtime_low_s,
+           d.battery_voltage,
+           d.input_voltage,
+           d.input_frequency,
+           d.input_transfer_low,
+           d.output_voltage, d.output_frequency,
+           d.ups_realpower, d.ups_apparent_power,
+           d.ups_load, d.ups_beeper_status ? d.ups_beeper_status : "unknown",
+           d.ups_status_raw,
+           d.ac_present ? "true" : "false",
+           d.charging ? "true" : "false",
+           d.discharging ? "true" : "false",
+           d.low_battery ? "true" : "false",
+           d.fully_charged ? "true" : "false",
+           d.runtime_limit_expired ? "true" : "false",
+           d.ups_delay_shutdown_s,
+           millis(),
+           WiFi.RSSI(),
+           ac_lost_at,
+           ac_back_at,
+           g_temp_c,
+           g_last_poll_ok,
+           (unsigned long)g_poll_ok_mask,
+           ac_hist_pct());
   server.send(200, "application/json", json);
 }
 
@@ -619,8 +668,8 @@ void setup() {
   pinMode(USER_LED, OUTPUT);
   digitalWrite(USER_LED, HIGH);  // off (active-low)
   setCpuFrequencyMhz(80);
-  disp.setBrightness(1);
-  const uint8_t seg_helo[] = { 0x76, 0x79, 0x38, 0x3F }; // HELO
+  disp.setBrightness(2);
+  const uint8_t seg_helo[] = { 0x76, 0x79, 0x38, 0x3F };  // HELO
   disp.setSegments(seg_helo, 4, 0);
 
   g_ups_mutex = xSemaphoreCreateMutex();
@@ -634,12 +683,15 @@ void setup() {
 
   xTaskCreatePinnedToCore(usb_host_task, "usb_host", 4096, NULL, 5, NULL, 0);
 
-  WiFi.setSleep(WIFI_PS_MIN_MODEM);
-  // WiFi.setSleep(false);
+#ifdef CH3819_WIFI_H
+  ch3819_wifi_setup(CH3819_WiFi_SSID, CH3819_WiFi_KEY, CH3819_HOSTNAME_PREFIX);
+#else
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  { uint32_t t = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t < 20000) delay(300);
-  }
+#endif
+
+#ifdef CH3819_OTA_H
+  ch3819_ota_setup(CH3819_OTA_HOST, CH3819_OTA_PORT, __DATE__, __TIME__, "ups-monitor", 600000, nullptr);
+#endif
 
   server.on("/ups", handle_ups);
   server.on("/diag", handle_diag);
@@ -647,8 +699,10 @@ void setup() {
 }
 
 void loop() {
-  server.handleClient();
 
+#ifdef CH3819_WIFI_H
+  ch3819_wifi_loop();
+#else
   // WiFi reconnect: retry every 60s when disconnected
   static uint32_t last_wifi_try = 0;
   if (WiFi.status() != WL_CONNECTED && millis() - last_wifi_try >= 60000) {
@@ -656,6 +710,13 @@ void loop() {
     WiFi.disconnect();
     WiFi.begin(WIFI_SSID, WIFI_PASS);
   }
+#endif
+
+#ifdef CH3819_OTA_H
+  ch3819_ota_loop();
+#endif
+
+  server.handleClient();
 
   // Poll UPS every 5s; clear data if stale for 60s
   static uint32_t last_poll = 0;
@@ -706,35 +767,52 @@ void loop() {
     xSemaphoreGive(g_ups_mutex);
 
     // Segment encodings
-    const uint8_t seg_ups[]  = { 0x3E, 0x73, 0x6D, 0x00 };
+    const uint8_t seg_ups[] = { 0x3E, 0x73, 0x6D, 0x00 };
     const uint8_t seg_none[] = { 0x37, 0x3F, 0x37, 0x79 };
-    const uint8_t ip_ind[]   = { 0x01, 0x09, 0x49, 0x63 };
+    const uint8_t ip_ind[] = { 0x01, 0x09, 0x49, 0x63 };
 
     bool wifi_ok = WiFi.status() == WL_CONNECTED;
 
     switch (phase % 15) {
-      case 0:  show_word(g_dev_ready ? seg_ups : seg_none); break;
-      case 1:  if (d.valid) show_metric(SEG_VOLT, (int)(d.battery_voltage * 10));
-               else disp_off(); break;
-      case 2:  disp_off(); break;
-      case 3:  if (d.valid) show_metric(SEG_WATT, (int)d.ups_realpower);
-               else disp_off(); break;
-      case 4:  disp_off(); break;
-      case 5:  if (g_temp_c > -127.0) show_metric(SEG_TEMP, (int)(g_temp_c * 10));
-               else disp_off(); break;
-      case 6:  disp_off(); break;
-      case 7:  if (wifi_ok) show_metric(SEG_RSSI, WiFi.RSSI());
-               else disp_off(); break;
-      case 8:  disp_off(); break;
+      case 0: show_word(g_dev_ready ? seg_ups : seg_none); break;
+      case 1:
+        if (d.valid) show_metric(SEG_VOLT, (int)(d.battery_voltage * 10));
+        else disp_off();
+        break;
+      case 2: disp_off(); break;
+      case 3:
+        if (d.valid) show_metric(SEG_WATT, (int)d.ups_realpower);
+        else disp_off();
+        break;
+      case 4: disp_off(); break;
+      case 5:
+        if (g_temp_c > -127.0) show_metric(SEG_TEMP, (int)(g_temp_c * 10));
+        else disp_off();
+        break;
+      case 6: disp_off(); break;
+      case 7:
+        if (wifi_ok) show_metric(SEG_RSSI, WiFi.RSSI());
+        else disp_off();
+        break;
+      case 8: disp_off(); break;
       case 9:  // fall through
       case 10:
       case 11:
-      case 12: { int i = phase % 14 - 9;
-               if (wifi_ok) show_metric(ip_ind[i], WiFi.localIP()[i]);
-               else { const uint8_t no_wifi[] = {ip_ind[i], 0x10, 0x10, 0x10};
-                      show_word(no_wifi); } } break;
+      case 12:
+        {
+          int i = phase % 14 - 9;
+          if (wifi_ok) show_metric(ip_ind[i], WiFi.localIP()[i]);
+          else {
+            const uint8_t no_wifi[] = { ip_ind[i], 0x10, 0x10, 0x10 };
+            show_word(no_wifi);
+          }
+        }
+        break;
       case 13: disp_off(); break;
-      case 14: disp_start = millis(); last_phase = 99; break;
+      case 14:
+        disp_start = millis();
+        last_phase = 99;
+        break;
     }
   }
 
@@ -753,5 +831,4 @@ void loop() {
     delay(1);
     took_a_break_at = millis();
   }
-
 }
