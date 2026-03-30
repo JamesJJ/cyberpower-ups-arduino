@@ -30,6 +30,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "usb/usb_host.h"
+#include "esp_task_wdt.h"
 
 /*  ----------- DISABLE THESE 3 "CH3819_" INCLUDES (unless you are JamesJJ) ------------- */
 // #include <CH3819_PRIVATE.h>
@@ -157,6 +158,8 @@ static usb_host_client_handle_t g_client = NULL;
 static usb_device_handle_t g_dev = NULL;
 static uint8_t g_itf = 0;
 static volatile bool g_dev_ready = false;
+static SemaphoreHandle_t g_dev_mutex;  // protects g_dev/g_dev_ready access across cores
+static SemaphoreHandle_t g_xfer_sem;   // reusable semaphore for USB transfers
 
 // ── Decode helpers ────────────────────────────────────────────────────────────
 static uint32_t le_uint(const uint8_t *b, int off, int len) {
@@ -220,7 +223,13 @@ static void xfer_cb(usb_transfer_t *t) {
 }
 
 static bool get_feature_report(uint8_t rid, uint8_t *out, uint16_t len) {
-  if (!g_dev_ready || !g_dev) return false;
+  if (xSemaphoreTake(g_dev_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+  if (!g_dev_ready || !g_dev) {
+    xSemaphoreGive(g_dev_mutex);
+    return false;
+  }
+  usb_device_handle_t dev = g_dev;
+  xSemaphoreGive(g_dev_mutex);
 
   usb_transfer_t *t = NULL;
   if (usb_host_transfer_alloc(8 + len, 0, &t) != ESP_OK) return false;
@@ -236,21 +245,27 @@ static bool get_feature_report(uint8_t rid, uint8_t *out, uint16_t len) {
   t->data_buffer[7] = (uint8_t)(len >> 8);
 
   uint8_t tmp[64] = {};
-  XferCtx ctx = { xSemaphoreCreateBinary(), ESP_FAIL, tmp };
+  XferCtx ctx = { g_xfer_sem, ESP_FAIL, tmp };
 
   t->num_bytes = 8 + len;
-  t->device_handle = g_dev;
+  t->device_handle = dev;
   t->bEndpointAddress = 0;  // control EP
   t->callback = xfer_cb;
   t->context = &ctx;
   t->timeout_ms = 200;
 
   bool ok = false;
+  // Clear any stale signal on the reusable semaphore
+  xSemaphoreTake(g_xfer_sem, 0);
   if (usb_host_transfer_submit_control(g_client, t) == ESP_OK) {
-    if (xSemaphoreTake(ctx.sem, pdMS_TO_TICKS(300)) == pdTRUE)
+    if (xSemaphoreTake(g_xfer_sem, pdMS_TO_TICKS(300)) == pdTRUE)
       ok = (ctx.result == ESP_OK);
+    else {
+      // Timeout: wait longer for USB stack to complete before freeing
+      vTaskDelay(pdMS_TO_TICKS(200));
+      xSemaphoreTake(g_xfer_sem, 0);  // drain if callback fired late
+    }
   }
-  vSemaphoreDelete(ctx.sem);
   usb_host_transfer_free(t);
 
   if (ok) memcpy(out, tmp, len);
@@ -292,27 +307,34 @@ static bool is_known_rid(uint8_t rid) {
 
 // Fetch HID report descriptor and extract REPORT_ID values
 static void parse_hid_report_descriptor() {
-  if (!g_dev_ready || !g_dev) return;
+  if (xSemaphoreTake(g_dev_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+  if (!g_dev_ready || !g_dev) {
+    xSemaphoreGive(g_dev_mutex);
+    return;
+  }
+  usb_device_handle_t dev = g_dev;
+  uint8_t itf = g_itf;
+  xSemaphoreGive(g_dev_mutex);
 
   // GET_DESCRIPTOR: type 0x22 (HID Report), interface index
   usb_transfer_t *t = NULL;
   const uint16_t max_len = 512;
   if (usb_host_transfer_alloc(8 + max_len, 0, &t) != ESP_OK) return;
 
-  t->data_buffer[0] = 0x81;   // bmRequestType: D→H, Standard, Interface
-  t->data_buffer[1] = 0x06;   // bRequest: GET_DESCRIPTOR
-  t->data_buffer[2] = 0x00;   // wValue lo: descriptor index 0
-  t->data_buffer[3] = 0x22;   // wValue hi: HID Report descriptor type
-  t->data_buffer[4] = g_itf;  // wIndex lo: interface number
+  t->data_buffer[0] = 0x81;  // bmRequestType: D→H, Standard, Interface
+  t->data_buffer[1] = 0x06;  // bRequest: GET_DESCRIPTOR
+  t->data_buffer[2] = 0x00;  // wValue lo: descriptor index 0
+  t->data_buffer[3] = 0x22;  // wValue hi: HID Report descriptor type
+  t->data_buffer[4] = itf;   // wIndex lo: interface number
   t->data_buffer[5] = 0;
   t->data_buffer[6] = (uint8_t)(max_len & 0xFF);
   t->data_buffer[7] = (uint8_t)(max_len >> 8);
 
   uint8_t desc_buf[512] = {};
-  XferCtx ctx = { xSemaphoreCreateBinary(), ESP_FAIL, desc_buf };
+  XferCtx ctx = { g_xfer_sem, ESP_FAIL, desc_buf };
 
   t->num_bytes = 8 + max_len;
-  t->device_handle = g_dev;
+  t->device_handle = dev;
   t->bEndpointAddress = 0;
   t->callback = xfer_cb;
   t->context = &ctx;
@@ -320,13 +342,16 @@ static void parse_hid_report_descriptor() {
 
   bool ok = false;
   uint16_t desc_len = 0;
+  xSemaphoreTake(g_xfer_sem, 0);
   if (usb_host_transfer_submit_control(g_client, t) == ESP_OK) {
-    if (xSemaphoreTake(ctx.sem, pdMS_TO_TICKS(600)) == pdTRUE && ctx.result == ESP_OK) {
+    if (xSemaphoreTake(g_xfer_sem, pdMS_TO_TICKS(600)) == pdTRUE && ctx.result == ESP_OK) {
       ok = true;
       desc_len = t->actual_num_bytes > 8 ? t->actual_num_bytes - 8 : 0;
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      xSemaphoreTake(g_xfer_sem, 0);
     }
   }
-  vSemaphoreDelete(ctx.sem);
   usb_host_transfer_free(t);
 
   if (!ok || desc_len == 0) return;
@@ -466,32 +491,38 @@ static void usb_host_task(void *) {
                   const usb_device_desc_t *desc;
                   usb_host_get_device_descriptor(dev, &desc);
                   if (desc->idVendor == UPS_VID && desc->idProduct == UPS_PID) {
-                    // Claim first HID interface (interface 0)
                     const usb_config_desc_t *cfg_desc;
                     usb_host_get_active_config_descriptor(dev, &cfg_desc);
-                    // Find first HID interface number
                     int offset = 0;
                     const usb_intf_desc_t *intf = usb_parse_interface_descriptor(cfg_desc, 0, 0, &offset);
                     if (intf && usb_host_interface_claim(g_client, dev, intf->bInterfaceNumber, 0) == ESP_OK) {
+                      xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
                       g_itf = intf->bInterfaceNumber;
                       g_dev = dev;
                       g_dev_ready = true;
+                      xSemaphoreGive(g_dev_mutex);
                     }
                   } else {
                     usb_host_device_close(g_client, dev);
                   }
                 } else if (msg->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
-                  if (g_dev) {
-                    g_dev_ready = false;
+                  xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
+                  usb_device_handle_t dev = g_dev;
+                  uint8_t itf = g_itf;
+                  g_dev_ready = false;
+                  g_dev = NULL;
+                  xSemaphoreGive(g_dev_mutex);
+                  if (dev) {
+                    // Wait for any in-flight transfer to complete
+                    vTaskDelay(pdMS_TO_TICKS(500));
                     g_rid_scan_done = false;
                     g_desc_rid_count = 0;
                     memset(g_rid_responds, 0, sizeof(g_rid_responds));
                     xSemaphoreTake(g_ups_mutex, portMAX_DELAY);
                     g_ups = {};
                     xSemaphoreGive(g_ups_mutex);
-                    usb_host_interface_release(g_client, g_dev, g_itf);
-                    usb_host_device_close(g_client, g_dev);
-                    g_dev = NULL;
+                    usb_host_interface_release(g_client, dev, itf);
+                    usb_host_device_close(g_client, dev);
                   }
                 }
               },
@@ -499,9 +530,11 @@ static void usb_host_task(void *) {
   };
   ESP_ERROR_CHECK(usb_host_client_register(&ccfg, &g_client));
 
+  esp_task_wdt_add(NULL);
   while (true) {
     usb_host_lib_handle_events(pdMS_TO_TICKS(10), NULL);
     usb_host_client_handle_events(g_client, pdMS_TO_TICKS(10));
+    esp_task_wdt_reset();
   }
 }
 
@@ -567,9 +600,11 @@ static void handle_ups() {
 
   xSemaphoreTake(g_ups_mutex, portMAX_DELAY);
   UpsData d = g_ups;
+  uint32_t snap_ac_lost = ac_lost_at;
+  uint32_t snap_ac_back = ac_back_at;
   xSemaphoreGive(g_ups_mutex);
 
-  char json[900];
+  char json[1200];
   snprintf(json, sizeof(json),
            "{"
            "\"ups_connected\":%s,"
@@ -604,6 +639,9 @@ static void handle_ups() {
            "\"ups_update_ms\":%lu,"
            "\"poll_ok_mask\":\"0x%02lx\","
            "\"ac_present_pct_300s\":%.1f"
+#ifdef CH3819_OTA_H
+           ",\"v\":\"%s\""
+#endif
            "}",
            d.valid ? "true" : "false",
            d.battery_charge, d.battery_charge_low, d.battery_charge_warning,
@@ -625,38 +663,56 @@ static void handle_ups() {
            d.ups_delay_shutdown_s,
            millis(),
            WiFi.RSSI(),
-           ac_lost_at,
-           ac_back_at,
+           snap_ac_lost,
+           snap_ac_back,
            g_temp_c,
            g_last_poll_ok,
            (unsigned long)g_poll_ok_mask,
-           ac_hist_pct());
+           ac_hist_pct()
+#ifdef CH3819_OTA_H
+             ,
+           ch3819_ota_version()
+#endif
+  );
   server.send(200, "application/json", json);
 }
 
 static void handle_diag() {
+  // Snapshot shared state under device mutex
+  xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
+  uint32_t snap_mask = g_poll_ok_mask;
+  bool snap_scan_done = g_rid_scan_done;
+  uint8_t snap_desc_rids[64];
+  uint8_t snap_rid_count = g_desc_rid_count;
+  memcpy(snap_desc_rids, g_desc_rids, snap_rid_count);
+  uint8_t snap_unknown[64];
+  bool snap_responds[64];
+  memcpy(snap_unknown, g_unknown_rids, sizeof(snap_unknown));
+  memcpy(snap_responds, g_rid_responds, sizeof(snap_responds));
+  xSemaphoreGive(g_dev_mutex);
+
   char hex[8];
   String out = "{\"poll_ok_mask\":\"0x";
-  snprintf(hex, sizeof(hex), "%02lx", (unsigned long)g_poll_ok_mask);
+  snprintf(hex, sizeof(hex), "%02lx", (unsigned long)snap_mask);
   out += hex;
   out += "\",\"rid_scan_done\":";
-  out += g_rid_scan_done ? "true" : "false";
+  out += snap_scan_done ? "true" : "false";
   out += ",\"descriptor_rids\":[";
-  for (uint8_t i = 0; i < g_desc_rid_count; i++) {
+  for (uint8_t i = 0; i < snap_rid_count; i++) {
     if (i) out += ",";
-    snprintf(hex, sizeof(hex), "\"0x%02x\"", g_desc_rids[i]);
+    snprintf(hex, sizeof(hex), "\"0x%02x\"", snap_desc_rids[i]);
     out += hex;
   }
   out += "],\"unknown_rids\":{";
   bool first = true;
   for (uint8_t i = 0; i < 0x40; i++) {
-    if (!g_rid_responds[i]) continue;
+    if (!snap_responds[i]) continue;
     if (!first) out += ",";
     first = false;
     snprintf(hex, sizeof(hex), "\"0x%02x\"", i);
     out += hex;
     out += ":";
-    snprintf(hex, sizeof(hex), "%u", g_unknown_rids[i]);
+    snprintf(hex, sizeof(hex), "%u", snap_unknown[i]);
     out += hex;
   }
   out += "}}";
@@ -673,6 +729,8 @@ void setup() {
   disp.setSegments(seg_helo, 4, 0);
 
   g_ups_mutex = xSemaphoreCreateMutex();
+  g_dev_mutex = xSemaphoreCreateMutex();
+  g_xfer_sem = xSemaphoreCreateBinary();
 
   tempSensor.begin();
   tempSensor.setWaitForConversion(false);
@@ -681,7 +739,7 @@ void setup() {
     tempSensor.requestTemperatures();
   }
 
-  xTaskCreatePinnedToCore(usb_host_task, "usb_host", 4096, NULL, 5, NULL, 0);
+  xTaskCreatePinnedToCore(usb_host_task, "usb_host", 8192, NULL, 5, NULL, 0);
 
 #ifdef CH3819_WIFI_H
   ch3819_wifi_setup(CH3819_WiFi_SSID, CH3819_WiFi_KEY, CH3819_HOSTNAME_PREFIX);
