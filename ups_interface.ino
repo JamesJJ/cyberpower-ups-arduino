@@ -776,13 +776,13 @@ void loop() {
 
   server.handleClient();
 
-  // Poll UPS every 1s; clear data if stale for 60s
+  // Poll UPS every 1s; clear data if stale for 20s
   static uint32_t last_poll = 0;
   if (millis() - last_poll >= 1000) {
     last_poll = millis();
     if (g_dev_ready) poll_ups();
   }
-  if (g_ups.valid && g_last_poll_ok && millis() - g_last_poll_ok > 60000) {
+  if (g_ups.valid && g_last_poll_ok && millis() - g_last_poll_ok > 20000) {
     xSemaphoreTake(g_ups_mutex, portMAX_DELAY);
     g_ups = {};
     xSemaphoreGive(g_ups_mutex);
