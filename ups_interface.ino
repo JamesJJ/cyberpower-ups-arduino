@@ -19,6 +19,9 @@
 /* https://github.com/JamesJJ/cyberpower-ups-arduino  */
 /* ################################################## */
 
+#if !defined(ARDUINO_XIAO_ESP32S3)
+  #error "Wrong board selected!"
+#endif
 
 #include "Arduino.h"
 #include "WiFi.h"
