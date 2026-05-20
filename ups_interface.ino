@@ -20,7 +20,7 @@
 /* ################################################## */
 
 #if !defined(ARDUINO_XIAO_ESP32S3)
-  #error "Wrong board selected!"
+#error "Wrong board selected!"
 #endif
 
 #include "Arduino.h"
@@ -642,6 +642,9 @@ static void handle_ups() {
            "\"ups_update_ms\":%lu,"
            "\"poll_ok_mask\":\"0x%02lx\","
            "\"ac_present_pct_300s\":%.1f"
+#ifdef CH3819_WIFI_H
+           ",\"wifi_bssid24\":%lu"
+#endif
 #ifdef CH3819_OTA_H
            ",\"v\":\"%s\""
 #endif
@@ -672,6 +675,10 @@ static void handle_ups() {
            g_last_poll_ok,
            (unsigned long)g_poll_ok_mask,
            ac_hist_pct()
+#ifdef CH3819_WIFI_H
+             ,
+           (unsigned long)ch3819_wifi_bssid24()
+#endif
 #ifdef CH3819_OTA_H
              ,
            ch3819_ota_version()
