@@ -643,7 +643,7 @@ static void handle_ups() {
            "\"poll_ok_mask\":\"0x%02lx\","
            "\"ac_present_pct_300s\":%.1f"
 #ifdef CH3819_WIFI_H
-           ",\"wifi_bssid24\":%lu"
+           ",\"bssid\":\"%s\""
 #endif
 #ifdef CH3819_OTA_H
            ",\"v\":\"%s\""
@@ -677,7 +677,7 @@ static void handle_ups() {
            ac_hist_pct()
 #ifdef CH3819_WIFI_H
              ,
-           (unsigned long)ch3819_wifi_bssid24()
+           ch3819_wifi_bssid().c_str()
 #endif
 #ifdef CH3819_OTA_H
              ,
