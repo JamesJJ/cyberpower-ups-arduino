@@ -32,6 +32,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "usb/usb_host.h"
 #include "esp_task_wdt.h"
 
@@ -75,6 +76,41 @@ static bool tempFound = false;
 
 #define UPS_VID 0x0764
 #define UPS_PID 0x0601
+
+// Explicit declarations prevent Arduino's prototype generator from depending on
+// Ctags-specific return-type metadata. This supports both Arduino Ctags and
+// Universal Ctags without changing normal C++ compilation.
+static void ac_hist_record(bool ac_on);
+static float ac_hist_pct();
+static uint32_t le_uint(const uint8_t *b, int off, int len);
+static const char *beeper_str(uint8_t v);
+static float freq_index(uint8_t i);
+static float freq_nom(uint8_t i);
+static float volt_nom(uint8_t i);
+static float batt_volt_nom(uint8_t i);
+static void xfer_cb(usb_transfer_t *t);
+static bool control_in(uint8_t request_type, uint8_t request, uint16_t value, uint16_t index, uint16_t len, uint32_t expected_generation, uint8_t *out, size_t out_capacity, size_t *actual_data_len, uint32_t wait_ms);
+static bool get_feature_report(uint8_t rid, uint8_t *out, uint16_t len, uint32_t generation);
+static bool is_known_rid(uint8_t rid);
+static bool parse_hid_report_descriptor(uint32_t generation);
+static void poll_ups();
+static void reset_rid_state_locked();
+static void close_opened_device(usb_device_handle_t dev);
+static bool try_open_ups(uint8_t addr);
+static void mark_device_gone(usb_device_handle_t gone);
+static void process_pending_cleanup();
+static void scan_for_ups();
+static void usb_event_cb(const usb_host_client_event_msg_t *msg, void *arg);
+static void usb_host_task(void *arg);
+static void disp_flush();
+static void show_word(const uint8_t segs[4]);
+static void encode_number(int value);
+static void show_metric(uint8_t indicator, int value);
+static void disp_off();
+static void handle_ups();
+static void handle_diag();
+void setup();
+void loop();
 
 // ── UPS data ──────────────────────────────────────────────────────────────────
 struct UpsData {
@@ -161,8 +197,26 @@ static usb_host_client_handle_t g_client = NULL;
 static usb_device_handle_t g_dev = NULL;
 static uint8_t g_itf = 0;
 static volatile bool g_dev_ready = false;
-static SemaphoreHandle_t g_dev_mutex;  // protects g_dev/g_dev_ready access across cores
-static SemaphoreHandle_t g_xfer_sem;   // reusable semaphore for USB transfers
+static uint32_t g_dev_generation = 0;  // protected by g_dev_mutex
+static SemaphoreHandle_t g_dev_mutex;
+
+// One persistent control transfer. A submitted transfer is never freed while it
+// may still be owned by ESP-IDF, even if the caller stops waiting for it.
+#define USB_CTRL_MAX_DATA 512
+static usb_transfer_t *g_xfer = NULL;
+static SemaphoreHandle_t g_xfer_mutex;
+static SemaphoreHandle_t g_xfer_sem;
+static volatile bool g_xfer_in_flight = false;
+static esp_err_t g_xfer_result = ESP_FAIL;
+static int g_xfer_actual_num_bytes = 0;
+
+// The ESP-IDF callback only copies events here. The USB task performs all
+// potentially blocking open/claim/release/close work after handle_events().
+static QueueHandle_t g_usb_event_queue;
+static volatile bool g_usb_rescan_requested = false;
+static usb_device_handle_t g_cleanup_dev = NULL;  // USB task only
+static uint8_t g_cleanup_itf = 0;                 // USB task only
+static bool g_cleanup_pending = false;            // USB task only
 
 // ── Decode helpers ────────────────────────────────────────────────────────────
 static uint32_t le_uint(const uint8_t *b, int off, int len) {
@@ -209,70 +263,107 @@ static float batt_volt_nom(uint8_t i) {
   return (i < 10) ? m[i] : 0;
 }
 
-// ── Synchronous HID GET_FEATURE_REPORT via control transfer ───────────────────
-struct XferCtx {
-  SemaphoreHandle_t sem;
-  esp_err_t result;
-  uint8_t *buf;
-};
-
+// ── Synchronous control transfer wrapper ──────────────────────────────────────
+// ESP-IDF 5.5 does not implement usb_transfer_t::timeout_ms. Keep the transfer
+// and all callback state alive permanently so a late completion is always safe.
 static void xfer_cb(usb_transfer_t *t) {
-  XferCtx *ctx = (XferCtx *)t->context;
-  ctx->result = (t->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
-  // data starts after 8-byte setup packet
-  if (ctx->result == ESP_OK && t->actual_num_bytes > 8)
-    memcpy(ctx->buf, t->data_buffer + 8, t->actual_num_bytes - 8);
-  xSemaphoreGive(ctx->sem);
+  g_xfer_result = (t->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
+  g_xfer_actual_num_bytes = t->actual_num_bytes;
+  // Give first, then publish idle. This prevents a new request from draining the
+  // semaphore before a late callback has given it.
+  xSemaphoreGive(g_xfer_sem);
+  __atomic_store_n(&g_xfer_in_flight, false, __ATOMIC_RELEASE);
 }
 
-static bool get_feature_report(uint8_t rid, uint8_t *out, uint16_t len) {
+static bool control_in(uint8_t request_type, uint8_t request,
+                       uint16_t value, uint16_t index, uint16_t len,
+                       uint32_t expected_generation, uint8_t *out,
+                       size_t out_capacity, size_t *actual_data_len,
+                       uint32_t wait_ms) {
+  if (!out || len > USB_CTRL_MAX_DATA || out_capacity < len || !g_xfer) return false;
+  if (xSemaphoreTake(g_xfer_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+
+  if (__atomic_load_n(&g_xfer_in_flight, __ATOMIC_ACQUIRE)) {
+    xSemaphoreGive(g_xfer_mutex);
+    return false;
+  }
+
+  if (xSemaphoreTake(g_dev_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    xSemaphoreGive(g_xfer_mutex);
+    return false;
+  }
+  if (!__atomic_load_n(&g_dev_ready, __ATOMIC_ACQUIRE) || !g_dev ||
+      g_dev_generation != expected_generation) {
+    xSemaphoreGive(g_dev_mutex);
+    xSemaphoreGive(g_xfer_mutex);
+    return false;
+  }
+
+  usb_device_handle_t dev = g_dev;
+  memset(g_xfer->data_buffer, 0, 8 + len);
+  g_xfer->data_buffer[0] = request_type;
+  g_xfer->data_buffer[1] = request;
+  g_xfer->data_buffer[2] = (uint8_t)(value & 0xFF);
+  g_xfer->data_buffer[3] = (uint8_t)(value >> 8);
+  g_xfer->data_buffer[4] = (uint8_t)(index & 0xFF);
+  g_xfer->data_buffer[5] = (uint8_t)(index >> 8);
+  g_xfer->data_buffer[6] = (uint8_t)(len & 0xFF);
+  g_xfer->data_buffer[7] = (uint8_t)(len >> 8);
+  g_xfer->num_bytes = 8 + len;
+  g_xfer->device_handle = dev;
+  g_xfer->bEndpointAddress = 0;
+  g_xfer->callback = xfer_cb;
+  g_xfer->context = NULL;
+  g_xfer->timeout_ms = 0;  // unsupported by the current ESP-IDF
+
+  xSemaphoreTake(g_xfer_sem, 0);  // drain a completed request whose waiter timed out
+  g_xfer_result = ESP_FAIL;
+  g_xfer_actual_num_bytes = 0;
+  __atomic_store_n(&g_xfer_in_flight, true, __ATOMIC_RELEASE);
+  esp_err_t submit_result = usb_host_transfer_submit_control(g_client, g_xfer);
+  if (submit_result != ESP_OK) {
+    __atomic_store_n(&g_xfer_in_flight, false, __ATOMIC_RELEASE);
+  }
+  // DEV_GONE cannot invalidate dev until submission has either succeeded or failed.
+  xSemaphoreGive(g_dev_mutex);
+
+  bool ok = false;
+  if (submit_result == ESP_OK &&
+      xSemaphoreTake(g_xfer_sem, pdMS_TO_TICKS(wait_ms)) == pdTRUE) {
+    // xfer_cb publishes idle immediately after giving the semaphore.
+    while (__atomic_load_n(&g_xfer_in_flight, __ATOMIC_ACQUIRE)) taskYIELD();
+    if (g_xfer_result == ESP_OK && g_xfer_actual_num_bytes >= 8) {
+      size_t received = (size_t)(g_xfer_actual_num_bytes - 8);
+      if (received > len) received = len;
+      if (received > out_capacity) received = out_capacity;
+      memset(out, 0, out_capacity);
+      memcpy(out, g_xfer->data_buffer + 8, received);
+      if (actual_data_len) *actual_data_len = received;
+      ok = true;
+    }
+  }
+
+  // On timeout the persistent transfer remains allocated and marked in-flight.
+  // A later callback safely returns it to idle; subsequent polls simply skip it.
+  xSemaphoreGive(g_xfer_mutex);
+  return ok;
+}
+
+static bool get_feature_report(uint8_t rid, uint8_t *out, uint16_t len,
+                               uint32_t generation) {
+  // HID GET_REPORT, report type Feature. Use the claimed interface, not a
+  // hard-coded interface zero.
+  uint8_t itf;
   if (xSemaphoreTake(g_dev_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
-  if (!g_dev_ready || !g_dev) {
+  if (!__atomic_load_n(&g_dev_ready, __ATOMIC_ACQUIRE) ||
+      g_dev_generation != generation) {
     xSemaphoreGive(g_dev_mutex);
     return false;
   }
-  usb_device_handle_t dev = g_dev;
+  itf = g_itf;
   xSemaphoreGive(g_dev_mutex);
-
-  usb_transfer_t *t = NULL;
-  if (usb_host_transfer_alloc(8 + len, 0, &t) != ESP_OK) return false;
-
-  // Build HID GET_FEATURE_REPORT setup packet
-  t->data_buffer[0] = 0xA1;  // bmRequestType: D→H, Class, Interface
-  t->data_buffer[1] = 0x01;  // bRequest: GET_REPORT
-  t->data_buffer[2] = rid;
-  t->data_buffer[3] = 0x03;  // report type: Feature
-  t->data_buffer[4] = 0;     // wIndex lo = interface number
-  t->data_buffer[5] = 0;     // wIndex hi
-  t->data_buffer[6] = (uint8_t)(len & 0xFF);
-  t->data_buffer[7] = (uint8_t)(len >> 8);
-
-  uint8_t tmp[64] = {};
-  XferCtx ctx = { g_xfer_sem, ESP_FAIL, tmp };
-
-  t->num_bytes = 8 + len;
-  t->device_handle = dev;
-  t->bEndpointAddress = 0;  // control EP
-  t->callback = xfer_cb;
-  t->context = &ctx;
-  t->timeout_ms = 200;
-
-  bool ok = false;
-  // Clear any stale signal on the reusable semaphore
-  xSemaphoreTake(g_xfer_sem, 0);
-  if (usb_host_transfer_submit_control(g_client, t) == ESP_OK) {
-    if (xSemaphoreTake(g_xfer_sem, pdMS_TO_TICKS(300)) == pdTRUE)
-      ok = (ctx.result == ESP_OK);
-    else {
-      // Timeout: wait longer for USB stack to complete before freeing
-      vTaskDelay(pdMS_TO_TICKS(200));
-      xSemaphoreTake(g_xfer_sem, 0);  // drain if callback fired late
-    }
-  }
-  usb_host_transfer_free(t);
-
-  if (ok) memcpy(out, tmp, len);
-  return ok;
+  return control_in(0xA1, 0x01, (uint16_t)(0x0300 | rid), itf, len,
+                    generation, out, len, NULL, 300);
 }
 
 // ── Poll and decode all UPS fields ───────────────────────────────────────────
@@ -308,99 +399,113 @@ static bool is_known_rid(uint8_t rid) {
   return false;
 }
 
-// Fetch HID report descriptor and extract REPORT_ID values
-static void parse_hid_report_descriptor() {
-  if (xSemaphoreTake(g_dev_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
-  if (!g_dev_ready || !g_dev) {
+// Fetch the HID report descriptor and publish its REPORT_ID values only if the
+// same device generation is still active when parsing completes.
+static bool parse_hid_report_descriptor(uint32_t generation) {
+  uint8_t itf;
+  if (xSemaphoreTake(g_dev_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+  if (!__atomic_load_n(&g_dev_ready, __ATOMIC_ACQUIRE) ||
+      g_dev_generation != generation) {
     xSemaphoreGive(g_dev_mutex);
-    return;
+    return false;
   }
-  usb_device_handle_t dev = g_dev;
-  uint8_t itf = g_itf;
+  itf = g_itf;
   xSemaphoreGive(g_dev_mutex);
 
-  // GET_DESCRIPTOR: type 0x22 (HID Report), interface index
-  usb_transfer_t *t = NULL;
-  const uint16_t max_len = 512;
-  if (usb_host_transfer_alloc(8 + max_len, 0, &t) != ESP_OK) return;
+  uint8_t desc_buf[USB_CTRL_MAX_DATA] = {};
+  size_t desc_len = 0;
+  if (!control_in(0x81, 0x06, 0x2200, itf, sizeof(desc_buf), generation,
+                  desc_buf, sizeof(desc_buf), &desc_len, 600) || desc_len == 0)
+    return false;
 
-  t->data_buffer[0] = 0x81;  // bmRequestType: D→H, Standard, Interface
-  t->data_buffer[1] = 0x06;  // bRequest: GET_DESCRIPTOR
-  t->data_buffer[2] = 0x00;  // wValue lo: descriptor index 0
-  t->data_buffer[3] = 0x22;  // wValue hi: HID Report descriptor type
-  t->data_buffer[4] = itf;   // wIndex lo: interface number
-  t->data_buffer[5] = 0;
-  t->data_buffer[6] = (uint8_t)(max_len & 0xFF);
-  t->data_buffer[7] = (uint8_t)(max_len >> 8);
-
-  uint8_t desc_buf[512] = {};
-  XferCtx ctx = { g_xfer_sem, ESP_FAIL, desc_buf };
-
-  t->num_bytes = 8 + max_len;
-  t->device_handle = dev;
-  t->bEndpointAddress = 0;
-  t->callback = xfer_cb;
-  t->context = &ctx;
-  t->timeout_ms = 500;
-
-  bool ok = false;
-  uint16_t desc_len = 0;
-  xSemaphoreTake(g_xfer_sem, 0);
-  if (usb_host_transfer_submit_control(g_client, t) == ESP_OK) {
-    if (xSemaphoreTake(g_xfer_sem, pdMS_TO_TICKS(600)) == pdTRUE && ctx.result == ESP_OK) {
-      ok = true;
-      desc_len = t->actual_num_bytes > 8 ? t->actual_num_bytes - 8 : 0;
-    } else {
-      vTaskDelay(pdMS_TO_TICKS(500));
-      xSemaphoreTake(g_xfer_sem, 0);
-    }
-  }
-  usb_host_transfer_free(t);
-
-  if (!ok || desc_len == 0) return;
-
-  // Walk HID item stream, collect REPORT_ID items (prefix 0x85 = 1-byte global, tag 8)
-  g_desc_rid_count = 0;
-  uint16_t i = 0;
-  while (i < desc_len && g_desc_rid_count < sizeof(g_desc_rids)) {
+  uint8_t parsed_rids[64];
+  uint8_t parsed_count = 0;
+  size_t i = 0;
+  while (i < desc_len && parsed_count < sizeof(parsed_rids)) {
     uint8_t prefix = desc_buf[i];
-    if (prefix == 0xFE) {  // long item
+    if (prefix == 0xFE) {
       if (i + 2 >= desc_len) break;
-      i += 3 + desc_buf[i + 1];
+      size_t item_len = 3U + desc_buf[i + 1];
+      if (item_len > desc_len - i) break;
+      i += item_len;
       continue;
     }
     uint8_t sz = prefix & 0x03;
-    if (sz == 3) sz = 4;  // size encoding: 0,1,2,4
-    if (prefix == 0x85 && sz == 1 && i + 1 < desc_len) {
-      g_desc_rids[g_desc_rid_count++] = desc_buf[i + 1];
-    }
-    i += 1 + sz;
+    if (sz == 3) sz = 4;
+    if ((size_t)sz + 1U > desc_len - i) break;
+    if (prefix == 0x85 && sz == 1) parsed_rids[parsed_count++] = desc_buf[i + 1];
+    i += 1U + sz;
   }
+
+  xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
+  bool current = __atomic_load_n(&g_dev_ready, __ATOMIC_ACQUIRE) &&
+                 g_dev_generation == generation;
+  if (current) {
+    memcpy(g_desc_rids, parsed_rids, parsed_count);
+    g_desc_rid_count = parsed_count;
+  }
+  xSemaphoreGive(g_dev_mutex);
+  return current;
 }
 
 static void poll_ups() {
+  uint32_t generation;
+  bool scan_done;
+  uint8_t desc_rids[64];
+  uint8_t desc_rid_count;
+
+  xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
+  if (!__atomic_load_n(&g_dev_ready, __ATOMIC_ACQUIRE) || !g_dev) {
+    xSemaphoreGive(g_dev_mutex);
+    return;
+  }
+  generation = g_dev_generation;
+  scan_done = g_rid_scan_done;
+  desc_rid_count = g_desc_rid_count;
+  memcpy(desc_rids, g_desc_rids, desc_rid_count);
+  xSemaphoreGive(g_dev_mutex);
+
   uint8_t buf[64];
   UpsData d = {};
   d.ups_beeper_status = "unknown";
   uint32_t mask = 0;
 
   auto rd = [&](uint8_t rid) -> bool {
-    memset(buf, 0, 64);
-    return get_feature_report(rid, buf, 64);
+    memset(buf, 0, sizeof(buf));
+    return get_feature_report(rid, buf, sizeof(buf), generation);
   };
 
-  // One-time: parse HID descriptor and probe unknown RIDs
-  if (!g_rid_scan_done) {
-    if (g_desc_rid_count == 0) parse_hid_report_descriptor();
-    for (uint8_t i = 0; i < g_desc_rid_count; i++) {
-      uint8_t rid = g_desc_rids[i];
-      if (is_known_rid(rid) || rid >= 64) continue;
-      if (rd(rid)) {
-        g_rid_responds[rid] = true;
-        g_unknown_rids[rid] = buf[1];
+  if (!scan_done) {
+    bool descriptor_ready = desc_rid_count > 0;
+    if (!descriptor_ready && parse_hid_report_descriptor(generation)) {
+      xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
+      if (g_dev_generation == generation) {
+        desc_rid_count = g_desc_rid_count;
+        memcpy(desc_rids, g_desc_rids, desc_rid_count);
+        descriptor_ready = desc_rid_count > 0;
       }
+      xSemaphoreGive(g_dev_mutex);
     }
-    g_rid_scan_done = true;
+    if (descriptor_ready) {
+      for (uint8_t i = 0; i < desc_rid_count; i++) {
+        uint8_t rid = desc_rids[i];
+        if (is_known_rid(rid) || rid >= 64) continue;
+        if (rd(rid)) {
+          xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
+          if (__atomic_load_n(&g_dev_ready, __ATOMIC_ACQUIRE) &&
+              g_dev_generation == generation) {
+            g_rid_responds[rid] = true;
+            g_unknown_rids[rid] = buf[1];
+          }
+          xSemaphoreGive(g_dev_mutex);
+        }
+      }
+      xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
+      if (__atomic_load_n(&g_dev_ready, __ATOMIC_ACQUIRE) &&
+          g_dev_generation == generation)
+        g_rid_scan_done = true;
+      xSemaphoreGive(g_dev_mutex);
+    }
   }
 
   if (rd(0x08)) {
@@ -436,14 +541,13 @@ static void poll_ups() {
   if (rd(0x19)) {
     d.ups_realpower = le_uint(buf, 1, 2);
     mask |= RID_REALPOWER;
-    if (rd(0x18)) {
-      d.ups_realpower_nominal = le_uint(buf, 1, 2);
-      d.ups_load = d.ups_realpower_nominal > 0
-                     ? d.ups_realpower / d.ups_realpower_nominal * 100.0f
-                     : 0;
-    }
   }
-  if (rd(0x18)) d.ups_realpower_nominal = le_uint(buf, 1, 2);
+  if (rd(0x18)) {
+    d.ups_realpower_nominal = le_uint(buf, 1, 2);
+    d.ups_load = d.ups_realpower_nominal > 0
+                   ? d.ups_realpower / d.ups_realpower_nominal * 100.0f
+                   : 0;
+  }
   if (rd(0x1d)) {
     d.ups_apparent_power = le_uint(buf, 1, 2);
     mask |= RID_APPARENT;
@@ -465,78 +569,206 @@ static void poll_ups() {
     d.ups_delay_shutdown_s = (raw == 0xFFFF) ? 0 : raw;
   }
 
-  g_poll_ok_mask = mask;
   d.valid = (mask & RID_REQUIRED) == RID_REQUIRED;
+  xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
+  if (!__atomic_load_n(&g_dev_ready, __ATOMIC_ACQUIRE) ||
+      g_dev_generation != generation) {
+    xSemaphoreGive(g_dev_mutex);
+    return;
+  }
   xSemaphoreTake(g_ups_mutex, portMAX_DELAY);
   if (g_ups.valid && d.ac_present != g_ups.ac_present) {
     if (d.ac_present) ac_back_at = millis();
     else ac_lost_at = millis();
   }
+  g_poll_ok_mask = mask;
   g_ups = d;
   g_last_poll_ok = millis();
   ac_hist_record(d.ac_present);
   xSemaphoreGive(g_ups_mutex);
+  xSemaphoreGive(g_dev_mutex);
 }
 
 // ── USB host task (runs on core 0) ────────────────────────────────────────────
-static void usb_host_task(void *) {
-  usb_host_config_t cfg = { .skip_phy_setup = false, .intr_flags = ESP_INTR_FLAG_LEVEL1 };
+static void reset_rid_state_locked() {
+  g_rid_scan_done = false;
+  g_desc_rid_count = 0;
+  memset(g_desc_rids, 0, sizeof(g_desc_rids));
+  memset(g_unknown_rids, 0, sizeof(g_unknown_rids));
+  memset(g_rid_responds, 0, sizeof(g_rid_responds));
+}
+
+static void close_opened_device(usb_device_handle_t dev) {
+  esp_err_t err = usb_host_device_close(g_client, dev);
+  if (err != ESP_OK && err != ESP_ERR_NOT_FOUND)
+    log_e("USB device close failed: %s", esp_err_to_name(err));
+}
+
+static bool try_open_ups(uint8_t addr) {
+  xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
+  bool busy = g_dev != NULL || g_cleanup_pending;
+  xSemaphoreGive(g_dev_mutex);
+  if (busy) return false;
+
+  usb_device_handle_t dev = NULL;
+  esp_err_t err = usb_host_device_open(g_client, addr, &dev);
+  if (err != ESP_OK) return false;
+
+  const usb_device_desc_t *desc = NULL;
+  err = usb_host_get_device_descriptor(dev, &desc);
+  if (err != ESP_OK || !desc) {
+    log_e("USB device descriptor failed: %s", esp_err_to_name(err));
+    close_opened_device(dev);
+    return false;
+  }
+  if (desc->idVendor != UPS_VID || desc->idProduct != UPS_PID) {
+    close_opened_device(dev);
+    return false;
+  }
+
+  const usb_config_desc_t *cfg_desc = NULL;
+  err = usb_host_get_active_config_descriptor(dev, &cfg_desc);
+  if (err != ESP_OK || !cfg_desc) {
+    log_e("USB config descriptor failed: %s", esp_err_to_name(err));
+    close_opened_device(dev);
+    return false;
+  }
+
+  const usb_intf_desc_t *intf = NULL;
+  for (uint8_t n = 0; n < cfg_desc->bNumInterfaces; n++) {
+    int offset = 0;
+    const usb_intf_desc_t *candidate =
+      usb_parse_interface_descriptor(cfg_desc, n, 0, &offset);
+    if (candidate && candidate->bInterfaceClass == 0x03) {
+      intf = candidate;
+      break;
+    }
+  }
+  if (!intf) {
+    log_e("No HID interface found on UPS");
+    close_opened_device(dev);
+    return false;
+  }
+
+  err = usb_host_interface_claim(g_client, dev, intf->bInterfaceNumber,
+                                 intf->bAlternateSetting);
+  if (err != ESP_OK) {
+    log_e("USB interface claim failed: %s", esp_err_to_name(err));
+    close_opened_device(dev);
+    return false;
+  }
+
+  xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
+  g_dev = dev;
+  g_itf = intf->bInterfaceNumber;
+  g_dev_generation++;
+  reset_rid_state_locked();
+  __atomic_store_n(&g_dev_ready, true, __ATOMIC_RELEASE);
+  xSemaphoreGive(g_dev_mutex);
+  return true;
+}
+
+static void mark_device_gone(usb_device_handle_t gone) {
+  xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
+  if (gone != g_dev) {
+    xSemaphoreGive(g_dev_mutex);
+    return;
+  }
+  __atomic_store_n(&g_dev_ready, false, __ATOMIC_RELEASE);
+  g_dev_generation++;
+  reset_rid_state_locked();
+  g_cleanup_dev = g_dev;
+  g_cleanup_itf = g_itf;
+  g_cleanup_pending = true;
+
+  // Keep lock order dev -> ups, matching poll_ups().
+  xSemaphoreTake(g_ups_mutex, portMAX_DELAY);
+  g_ups = {};
+  g_poll_ok_mask = 0;
+  xSemaphoreGive(g_ups_mutex);
+  xSemaphoreGive(g_dev_mutex);
+}
+
+static void process_pending_cleanup() {
+  if (!g_cleanup_pending ||
+      __atomic_load_n(&g_xfer_in_flight, __ATOMIC_ACQUIRE))
+    return;
+
+  esp_err_t err = usb_host_interface_release(g_client, g_cleanup_dev, g_cleanup_itf);
+  if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+    log_w("USB interface release deferred: %s", esp_err_to_name(err));
+    return;
+  }
+  err = usb_host_device_close(g_client, g_cleanup_dev);
+  if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+    log_w("USB device close deferred: %s", esp_err_to_name(err));
+    return;
+  }
+
+  xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
+  if (g_dev == g_cleanup_dev) {
+    g_dev = NULL;
+    g_itf = 0;
+  }
+  g_cleanup_dev = NULL;
+  g_cleanup_pending = false;
+  xSemaphoreGive(g_dev_mutex);
+  __atomic_store_n(&g_usb_rescan_requested, true, __ATOMIC_RELEASE);
+}
+
+static void scan_for_ups() {
+  uint8_t addresses[8];
+  int count = 0;
+  if (usb_host_device_addr_list_fill(8, addresses, &count) != ESP_OK) return;
+  for (int i = 0; i < count; i++) {
+    if (try_open_ups(addresses[i])) break;
+  }
+}
+
+static void usb_event_cb(const usb_host_client_event_msg_t *msg, void *arg) {
+  (void)arg;
+  if (xQueueSend(g_usb_event_queue, msg, 0) != pdTRUE)
+    __atomic_store_n(&g_usb_rescan_requested, true, __ATOMIC_RELEASE);
+}
+
+static void usb_host_task(void *arg) {
+  (void)arg;
+  usb_host_config_t cfg = {};
+  cfg.skip_phy_setup = false;
+  cfg.intr_flags = ESP_INTR_FLAG_LEVEL1;
   ESP_ERROR_CHECK(usb_host_install(&cfg));
 
-  usb_host_client_config_t ccfg = {
-    .is_synchronous = false,
-    .max_num_event_msg = 5,
-    .async = { .client_event_callback = [](const usb_host_client_event_msg_t *msg, void *) {
-                if (msg->event == USB_HOST_CLIENT_EVENT_NEW_DEV) {
-                  uint8_t addr = msg->new_dev.address;
-                  usb_device_handle_t dev;
-                  if (usb_host_device_open(g_client, addr, &dev) != ESP_OK) return;
-                  const usb_device_desc_t *desc;
-                  usb_host_get_device_descriptor(dev, &desc);
-                  if (desc->idVendor == UPS_VID && desc->idProduct == UPS_PID) {
-                    const usb_config_desc_t *cfg_desc;
-                    usb_host_get_active_config_descriptor(dev, &cfg_desc);
-                    int offset = 0;
-                    const usb_intf_desc_t *intf = usb_parse_interface_descriptor(cfg_desc, 0, 0, &offset);
-                    if (intf && usb_host_interface_claim(g_client, dev, intf->bInterfaceNumber, 0) == ESP_OK) {
-                      xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
-                      g_itf = intf->bInterfaceNumber;
-                      g_dev = dev;
-                      g_dev_ready = true;
-                      xSemaphoreGive(g_dev_mutex);
-                    }
-                  } else {
-                    usb_host_device_close(g_client, dev);
-                  }
-                } else if (msg->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
-                  xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
-                  usb_device_handle_t dev = g_dev;
-                  uint8_t itf = g_itf;
-                  g_dev_ready = false;
-                  g_dev = NULL;
-                  xSemaphoreGive(g_dev_mutex);
-                  if (dev) {
-                    // Wait for any in-flight transfer to complete
-                    vTaskDelay(pdMS_TO_TICKS(500));
-                    g_rid_scan_done = false;
-                    g_desc_rid_count = 0;
-                    memset(g_rid_responds, 0, sizeof(g_rid_responds));
-                    xSemaphoreTake(g_ups_mutex, portMAX_DELAY);
-                    g_ups = {};
-                    xSemaphoreGive(g_ups_mutex);
-                    usb_host_interface_release(g_client, dev, itf);
-                    usb_host_device_close(g_client, dev);
-                  }
-                }
-              },
-               .callback_arg = NULL }
-  };
+  usb_host_client_config_t ccfg = {};
+  ccfg.is_synchronous = false;
+  ccfg.max_num_event_msg = 8;
+  ccfg.async.client_event_callback = usb_event_cb;
+  ccfg.async.callback_arg = NULL;
   ESP_ERROR_CHECK(usb_host_client_register(&ccfg, &g_client));
+  ESP_ERROR_CHECK(usb_host_transfer_alloc(8 + USB_CTRL_MAX_DATA, 0, &g_xfer));
 
   esp_task_wdt_add(NULL);
+  uint32_t last_scan = 0;
   while (true) {
     usb_host_lib_handle_events(pdMS_TO_TICKS(10), NULL);
     usb_host_client_handle_events(g_client, pdMS_TO_TICKS(10));
+
+    usb_host_client_event_msg_t event;
+    while (xQueueReceive(g_usb_event_queue, &event, 0) == pdTRUE) {
+      if (event.event == USB_HOST_CLIENT_EVENT_NEW_DEV) {
+        if (!try_open_ups(event.new_dev.address))
+          __atomic_store_n(&g_usb_rescan_requested, true, __ATOMIC_RELEASE);
+      } else if (event.event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
+        mark_device_gone(event.dev_gone.dev_hdl);
+      }
+    }
+
+    process_pending_cleanup();
+    bool should_scan = __atomic_exchange_n(&g_usb_rescan_requested, false, __ATOMIC_ACQ_REL);
+    if ((should_scan || millis() - last_scan >= 1000) &&
+        !__atomic_load_n(&g_dev_ready, __ATOMIC_ACQUIRE) && !g_cleanup_pending) {
+      last_scan = millis();
+      scan_for_ups();
+    }
     esp_task_wdt_reset();
   }
 }
@@ -605,6 +837,7 @@ static void handle_ups() {
   UpsData d = g_ups;
   uint32_t snap_ac_lost = ac_lost_at;
   uint32_t snap_ac_back = ac_back_at;
+  uint32_t snap_poll_mask = g_poll_ok_mask;
   xSemaphoreGive(g_ups_mutex);
 
   char json[1200];
@@ -673,7 +906,7 @@ static void handle_ups() {
            snap_ac_back,
            g_temp_c,
            g_last_poll_ok,
-           (unsigned long)g_poll_ok_mask,
+           (unsigned long)snap_poll_mask,
            ac_hist_pct()
 #ifdef CH3819_WIFI_H
              ,
@@ -688,9 +921,12 @@ static void handle_ups() {
 }
 
 static void handle_diag() {
-  // Snapshot shared state under device mutex
-  xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
+  xSemaphoreTake(g_ups_mutex, portMAX_DELAY);
   uint32_t snap_mask = g_poll_ok_mask;
+  xSemaphoreGive(g_ups_mutex);
+
+  // Snapshot descriptor scan state under its actual writer mutex.
+  xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
   bool snap_scan_done = g_rid_scan_done;
   uint8_t snap_desc_rids[64];
   uint8_t snap_rid_count = g_desc_rid_count;
@@ -702,7 +938,9 @@ static void handle_diag() {
   xSemaphoreGive(g_dev_mutex);
 
   char hex[8];
-  String out = "{\"poll_ok_mask\":\"0x";
+  String out;
+  out.reserve(768);
+  out = "{\"poll_ok_mask\":\"0x";
   snprintf(hex, sizeof(hex), "%02lx", (unsigned long)snap_mask);
   out += hex;
   out += "\",\"rid_scan_done\":";
@@ -740,7 +978,14 @@ void setup() {
 
   g_ups_mutex = xSemaphoreCreateMutex();
   g_dev_mutex = xSemaphoreCreateMutex();
+  g_xfer_mutex = xSemaphoreCreateMutex();
   g_xfer_sem = xSemaphoreCreateBinary();
+  g_usb_event_queue = xQueueCreate(8, sizeof(usb_host_client_event_msg_t));
+  if (!g_ups_mutex || !g_dev_mutex || !g_xfer_mutex || !g_xfer_sem ||
+      !g_usb_event_queue) {
+    log_e("Failed to allocate synchronization primitives");
+    abort();
+  }
 
   tempSensor.begin();
   tempSensor.setWaitForConversion(false);
@@ -749,7 +994,10 @@ void setup() {
     tempSensor.requestTemperatures();
   }
 
-  xTaskCreatePinnedToCore(usb_host_task, "usb_host", 8192, NULL, 5, NULL, 0);
+  if (xTaskCreatePinnedToCore(usb_host_task, "usb_host", 8192, NULL, 5, NULL, 0) != pdPASS) {
+    log_e("Failed to create USB host task");
+    abort();
+  }
 
 #ifdef CH3819_WIFI_H
   ch3819_wifi_setup(CH3819_WiFi_SSID, CH3819_WiFi_KEY, CH3819_HOSTNAME_PREFIX);
@@ -790,11 +1038,11 @@ void loop() {
   static uint32_t last_poll = 0;
   if (millis() - last_poll >= 1000) {
     last_poll = millis();
-    if (g_dev_ready) poll_ups();
+    if (__atomic_load_n(&g_dev_ready, __ATOMIC_ACQUIRE)) poll_ups();
   }
-  if (g_ups.valid && g_last_poll_ok && millis() - g_last_poll_ok > 20000) {
+  if (g_last_poll_ok && millis() - g_last_poll_ok > 20000) {
     xSemaphoreTake(g_ups_mutex, portMAX_DELAY);
-    g_ups = {};
+    if (g_ups.valid) g_ups = {};
     xSemaphoreGive(g_ups_mutex);
   }
 
@@ -860,7 +1108,7 @@ void loop() {
     switch (phase) {
       case 0:
         {
-          if (g_dev_ready) {
+          if (__atomic_load_n(&g_dev_ready, __ATOMIC_ACQUIRE)) {
             show_word(seg_ups);
           } else {
             show_word((millis() / 400) % 2 ? seg_err : seg_usb);
