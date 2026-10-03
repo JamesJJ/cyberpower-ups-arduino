@@ -3,6 +3,17 @@
  * CyberPower UPS HID host → WiFi JSON HTTP server
  * Target: XIAO ESP32S3 (hwcdc default, USB OTG host)
  *
+ * Build compatibility (validated 2026-10-03):
+ *   - Primary: Arduino ESP32 core 3.3.12 / ESP-IDF 5.5.5
+ *   - Compatible: Arduino ESP32 core 3.3.10 / ESP-IDF 5.5.4
+ *   - Libraries: TM1637 1.2.0, OneWire 2.3.8, DallasTemperature 4.0.6
+ *   - Optional private build: CH3819_PRIVATE 0.0.2, CH3819_WIFI 1.0.0,
+ *     CH3819_OTA 1.1.0
+ *
+ * ESP32 core 3.3.12 enables the USB enumeration-filter callback whereas
+ * 3.3.10 does not. The callback below is deliberately supplied for both, so
+ * neither of these previously supported versions is excluded.
+ *
  * Uses ESP-IDF native USB host stack to send HID GET_FEATURE_REPORT
  * control transfers to CyberPower CP1500PFCLCDA (VID=0x0764, PID=0x0601).
  * Serves decoded UPS status as JSON on http://<ip>/ups
@@ -96,10 +107,13 @@ static bool parse_hid_report_descriptor(uint32_t generation);
 static void poll_ups();
 static void reset_rid_state_locked();
 static void close_opened_device(usb_device_handle_t dev);
+static const char *usb_stage_str(uint8_t stage);
+static void set_usb_stage(uint8_t stage, esp_err_t error);
 static bool try_open_ups(uint8_t addr);
 static void mark_device_gone(usb_device_handle_t gone);
 static void process_pending_cleanup();
 static void scan_for_ups();
+static bool usb_enum_filter_cb(const usb_device_desc_t *dev_desc, uint8_t *configuration_value);
 static void usb_event_cb(const usb_host_client_event_msg_t *msg, void *arg);
 static void usb_host_task(void *arg);
 static void disp_flush();
@@ -218,6 +232,62 @@ static usb_device_handle_t g_cleanup_dev = NULL;  // USB task only
 static uint8_t g_cleanup_itf = 0;                 // USB task only
 static bool g_cleanup_pending = false;            // USB task only
 
+enum UsbStage : uint8_t {
+  USB_STAGE_STARTING,
+  USB_STAGE_WAITING,
+  USB_STAGE_OPENING,
+  USB_STAGE_DESCRIPTOR_FAILED,
+  USB_STAGE_CONFIG_FAILED,
+  USB_STAGE_INTERFACE_FAILED,
+  USB_STAGE_CLAIM_FAILED,
+  USB_STAGE_READY,
+  USB_STAGE_GONE,
+  USB_STAGE_CLEANUP
+};
+// Protected by g_dev_mutex unless declared volatile and accessed atomically.
+static uint8_t g_usb_stage = USB_STAGE_STARTING;
+static esp_err_t g_usb_last_error = ESP_OK;
+static uint16_t g_usb_last_vid = 0;
+static uint16_t g_usb_last_pid = 0;
+static uint8_t g_usb_interface_count = 0;
+static uint8_t g_usb_selected_interface = 0;
+static uint8_t g_usb_selected_class = 0;
+static uint32_t g_usb_new_events = 0;
+static uint32_t g_usb_gone_events = 0;
+static uint32_t g_usb_open_attempts = 0;
+static volatile int g_xfer_last_submit_result = ESP_OK;
+static volatile int g_xfer_last_status = -1;
+static volatile uint32_t g_xfer_submit_count = 0;
+static volatile uint32_t g_xfer_callback_count = 0;
+static volatile uint32_t g_xfer_timeout_count = 0;
+static volatile uint32_t g_usb_task_loops = 0;
+static volatile int g_usb_last_lib_result = ESP_OK;
+static volatile int g_usb_last_client_result = ESP_OK;
+static volatile int g_usb_library_device_count = 0;
+
+static const char *usb_stage_str(uint8_t stage) {
+  switch (stage) {
+    case USB_STAGE_STARTING: return "starting";
+    case USB_STAGE_WAITING: return "waiting";
+    case USB_STAGE_OPENING: return "opening";
+    case USB_STAGE_DESCRIPTOR_FAILED: return "descriptor_failed";
+    case USB_STAGE_CONFIG_FAILED: return "config_failed";
+    case USB_STAGE_INTERFACE_FAILED: return "interface_failed";
+    case USB_STAGE_CLAIM_FAILED: return "claim_failed";
+    case USB_STAGE_READY: return "ready";
+    case USB_STAGE_GONE: return "gone";
+    case USB_STAGE_CLEANUP: return "cleanup";
+    default: return "unknown";
+  }
+}
+
+static void set_usb_stage(uint8_t stage, esp_err_t error) {
+  xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
+  g_usb_stage = stage;
+  g_usb_last_error = error;
+  xSemaphoreGive(g_dev_mutex);
+}
+
 // ── Decode helpers ────────────────────────────────────────────────────────────
 static uint32_t le_uint(const uint8_t *b, int off, int len) {
   uint32_t v = 0;
@@ -267,6 +337,8 @@ static float batt_volt_nom(uint8_t i) {
 // ESP-IDF 5.5 does not implement usb_transfer_t::timeout_ms. Keep the transfer
 // and all callback state alive permanently so a late completion is always safe.
 static void xfer_cb(usb_transfer_t *t) {
+  __atomic_store_n(&g_xfer_last_status, (int)t->status, __ATOMIC_RELEASE);
+  __atomic_add_fetch(&g_xfer_callback_count, 1U, __ATOMIC_RELAXED);
   g_xfer_result = (t->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
   g_xfer_actual_num_bytes = t->actual_num_bytes;
   // Give first, then publish idle. This prevents a new request from draining the
@@ -321,6 +393,8 @@ static bool control_in(uint8_t request_type, uint8_t request,
   g_xfer_actual_num_bytes = 0;
   __atomic_store_n(&g_xfer_in_flight, true, __ATOMIC_RELEASE);
   esp_err_t submit_result = usb_host_transfer_submit_control(g_client, g_xfer);
+  __atomic_store_n(&g_xfer_last_submit_result, (int)submit_result, __ATOMIC_RELEASE);
+  __atomic_add_fetch(&g_xfer_submit_count, 1U, __ATOMIC_RELAXED);
   if (submit_result != ESP_OK) {
     __atomic_store_n(&g_xfer_in_flight, false, __ATOMIC_RELEASE);
   }
@@ -328,18 +402,21 @@ static bool control_in(uint8_t request_type, uint8_t request,
   xSemaphoreGive(g_dev_mutex);
 
   bool ok = false;
-  if (submit_result == ESP_OK &&
-      xSemaphoreTake(g_xfer_sem, pdMS_TO_TICKS(wait_ms)) == pdTRUE) {
-    // xfer_cb publishes idle immediately after giving the semaphore.
-    while (__atomic_load_n(&g_xfer_in_flight, __ATOMIC_ACQUIRE)) taskYIELD();
-    if (g_xfer_result == ESP_OK && g_xfer_actual_num_bytes >= 8) {
-      size_t received = (size_t)(g_xfer_actual_num_bytes - 8);
-      if (received > len) received = len;
-      if (received > out_capacity) received = out_capacity;
-      memset(out, 0, out_capacity);
-      memcpy(out, g_xfer->data_buffer + 8, received);
-      if (actual_data_len) *actual_data_len = received;
-      ok = true;
+  if (submit_result == ESP_OK) {
+    if (xSemaphoreTake(g_xfer_sem, pdMS_TO_TICKS(wait_ms)) == pdTRUE) {
+      // xfer_cb publishes idle immediately after giving the semaphore.
+      while (__atomic_load_n(&g_xfer_in_flight, __ATOMIC_ACQUIRE)) taskYIELD();
+      if (g_xfer_result == ESP_OK && g_xfer_actual_num_bytes >= 8) {
+        size_t received = (size_t)(g_xfer_actual_num_bytes - 8);
+        if (received > len) received = len;
+        if (received > out_capacity) received = out_capacity;
+        memset(out, 0, out_capacity);
+        memcpy(out, g_xfer->data_buffer + 8, received);
+        if (actual_data_len) *actual_data_len = received;
+        ok = true;
+      }
+    } else {
+      __atomic_add_fetch(&g_xfer_timeout_count, 1U, __ATOMIC_RELAXED);
     }
   }
 
@@ -607,21 +684,35 @@ static void close_opened_device(usb_device_handle_t dev) {
 static bool try_open_ups(uint8_t addr) {
   xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
   bool busy = g_dev != NULL || g_cleanup_pending;
+  if (!busy) {
+    g_usb_open_attempts++;
+    g_usb_stage = USB_STAGE_OPENING;
+    g_usb_last_error = ESP_OK;
+  }
   xSemaphoreGive(g_dev_mutex);
   if (busy) return false;
 
   usb_device_handle_t dev = NULL;
   esp_err_t err = usb_host_device_open(g_client, addr, &dev);
-  if (err != ESP_OK) return false;
+  if (err != ESP_OK) {
+    set_usb_stage(USB_STAGE_WAITING, err);
+    return false;
+  }
 
   const usb_device_desc_t *desc = NULL;
   err = usb_host_get_device_descriptor(dev, &desc);
   if (err != ESP_OK || !desc) {
     log_e("USB device descriptor failed: %s", esp_err_to_name(err));
+    set_usb_stage(USB_STAGE_DESCRIPTOR_FAILED, err);
     close_opened_device(dev);
     return false;
   }
+  xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
+  g_usb_last_vid = desc->idVendor;
+  g_usb_last_pid = desc->idProduct;
+  xSemaphoreGive(g_dev_mutex);
   if (desc->idVendor != UPS_VID || desc->idProduct != UPS_PID) {
+    set_usb_stage(USB_STAGE_WAITING, ESP_ERR_NOT_FOUND);
     close_opened_device(dev);
     return false;
   }
@@ -630,22 +721,31 @@ static bool try_open_ups(uint8_t addr) {
   err = usb_host_get_active_config_descriptor(dev, &cfg_desc);
   if (err != ESP_OK || !cfg_desc) {
     log_e("USB config descriptor failed: %s", esp_err_to_name(err));
+    set_usb_stage(USB_STAGE_CONFIG_FAILED, err);
     close_opened_device(dev);
     return false;
   }
 
   const usb_intf_desc_t *intf = NULL;
+  const usb_intf_desc_t *first_intf = NULL;
   for (uint8_t n = 0; n < cfg_desc->bNumInterfaces; n++) {
     int offset = 0;
     const usb_intf_desc_t *candidate =
       usb_parse_interface_descriptor(cfg_desc, n, 0, &offset);
-    if (candidate && candidate->bInterfaceClass == 0x03) {
+    if (!candidate) continue;
+    if (!first_intf) first_intf = candidate;
+    if (candidate->bInterfaceClass == 0x03) {
       intf = candidate;
       break;
     }
   }
+  // This known UPS worked with interface 0 before class filtering was added.
+  // Prefer HID, but retain the first-interface behavior for nonconforming
+  // descriptors from the exact supported VID/PID.
+  if (!intf) intf = first_intf;
   if (!intf) {
-    log_e("No HID interface found on UPS");
+    log_e("No usable interface found on UPS");
+    set_usb_stage(USB_STAGE_INTERFACE_FAILED, ESP_ERR_NOT_FOUND);
     close_opened_device(dev);
     return false;
   }
@@ -654,6 +754,7 @@ static bool try_open_ups(uint8_t addr) {
                                  intf->bAlternateSetting);
   if (err != ESP_OK) {
     log_e("USB interface claim failed: %s", esp_err_to_name(err));
+    set_usb_stage(USB_STAGE_CLAIM_FAILED, err);
     close_opened_device(dev);
     return false;
   }
@@ -661,6 +762,11 @@ static bool try_open_ups(uint8_t addr) {
   xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
   g_dev = dev;
   g_itf = intf->bInterfaceNumber;
+  g_usb_interface_count = cfg_desc->bNumInterfaces;
+  g_usb_selected_interface = intf->bInterfaceNumber;
+  g_usb_selected_class = intf->bInterfaceClass;
+  g_usb_stage = USB_STAGE_READY;
+  g_usb_last_error = ESP_OK;
   g_dev_generation++;
   reset_rid_state_locked();
   __atomic_store_n(&g_dev_ready, true, __ATOMIC_RELEASE);
@@ -675,6 +781,8 @@ static void mark_device_gone(usb_device_handle_t gone) {
     return;
   }
   __atomic_store_n(&g_dev_ready, false, __ATOMIC_RELEASE);
+  g_usb_stage = USB_STAGE_GONE;
+  g_usb_last_error = ESP_OK;
   g_dev_generation++;
   reset_rid_state_locked();
   g_cleanup_dev = g_dev;
@@ -694,6 +802,7 @@ static void process_pending_cleanup() {
       __atomic_load_n(&g_xfer_in_flight, __ATOMIC_ACQUIRE))
     return;
 
+  set_usb_stage(USB_STAGE_CLEANUP, ESP_OK);
   esp_err_t err = usb_host_interface_release(g_client, g_cleanup_dev, g_cleanup_itf);
   if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
     log_w("USB interface release deferred: %s", esp_err_to_name(err));
@@ -712,6 +821,8 @@ static void process_pending_cleanup() {
   }
   g_cleanup_dev = NULL;
   g_cleanup_pending = false;
+  g_usb_stage = USB_STAGE_WAITING;
+  g_usb_last_error = ESP_OK;
   xSemaphoreGive(g_dev_mutex);
   __atomic_store_n(&g_usb_rescan_requested, true, __ATOMIC_RELEASE);
 }
@@ -725,6 +836,18 @@ static void scan_for_ups() {
   }
 }
 
+static bool usb_enum_filter_cb(const usb_device_desc_t *dev_desc,
+                               uint8_t *configuration_value) {
+  (void)dev_desc;
+  // Arduino ESP32 3.3.12 / ESP-IDF 5.5.5 enables
+  // CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK and rejects every device when
+  // this callback is NULL. Arduino ESP32 3.3.10 / ESP-IDF 5.5.4 leaves the
+  // feature disabled. Supplying this callback is compatible with both and
+  // preserves the older default by accepting each device's first configuration.
+  *configuration_value = 1;
+  return true;
+}
+
 static void usb_event_cb(const usb_host_client_event_msg_t *msg, void *arg) {
   (void)arg;
   if (xQueueSend(g_usb_event_queue, msg, 0) != pdTRUE)
@@ -735,7 +858,11 @@ static void usb_host_task(void *arg) {
   (void)arg;
   usb_host_config_t cfg = {};
   cfg.skip_phy_setup = false;
+  // Register the client before applying VBUS so an already-connected device's
+  // first enumeration event cannot precede client registration.
+  cfg.root_port_unpowered = true;
   cfg.intr_flags = ESP_INTR_FLAG_LEVEL1;
+  cfg.enum_filter_cb = usb_enum_filter_cb;
   ESP_ERROR_CHECK(usb_host_install(&cfg));
 
   usb_host_client_config_t ccfg = {};
@@ -745,19 +872,37 @@ static void usb_host_task(void *arg) {
   ccfg.async.callback_arg = NULL;
   ESP_ERROR_CHECK(usb_host_client_register(&ccfg, &g_client));
   ESP_ERROR_CHECK(usb_host_transfer_alloc(8 + USB_CTRL_MAX_DATA, 0, &g_xfer));
+  ESP_ERROR_CHECK(usb_host_lib_set_root_port_power(true));
+  set_usb_stage(USB_STAGE_WAITING, ESP_OK);
 
   esp_task_wdt_add(NULL);
   uint32_t last_scan = 0;
+  uint32_t last_info = 0;
   while (true) {
-    usb_host_lib_handle_events(pdMS_TO_TICKS(10), NULL);
-    usb_host_client_handle_events(g_client, pdMS_TO_TICKS(10));
+    esp_err_t lib_result = usb_host_lib_handle_events(pdMS_TO_TICKS(10), NULL);
+    esp_err_t client_result = usb_host_client_handle_events(g_client, pdMS_TO_TICKS(10));
+    __atomic_store_n(&g_usb_last_lib_result, (int)lib_result, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_usb_last_client_result, (int)client_result, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&g_usb_task_loops, 1U, __ATOMIC_RELAXED);
+    if (millis() - last_info >= 1000) {
+      last_info = millis();
+      usb_host_lib_info_t info = {};
+      if (usb_host_lib_info(&info) == ESP_OK)
+        __atomic_store_n(&g_usb_library_device_count, info.num_devices, __ATOMIC_RELEASE);
+    }
 
     usb_host_client_event_msg_t event;
     while (xQueueReceive(g_usb_event_queue, &event, 0) == pdTRUE) {
       if (event.event == USB_HOST_CLIENT_EVENT_NEW_DEV) {
+        xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
+        g_usb_new_events++;
+        xSemaphoreGive(g_dev_mutex);
         if (!try_open_ups(event.new_dev.address))
           __atomic_store_n(&g_usb_rescan_requested, true, __ATOMIC_RELEASE);
       } else if (event.event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
+        xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
+        g_usb_gone_events++;
+        xSemaphoreGive(g_dev_mutex);
         mark_device_gone(event.dev_gone.dev_hdl);
       }
     }
@@ -925,8 +1070,21 @@ static void handle_diag() {
   uint32_t snap_mask = g_poll_ok_mask;
   xSemaphoreGive(g_ups_mutex);
 
-  // Snapshot descriptor scan state under its actual writer mutex.
+  // Snapshot USB and descriptor state under its actual writer mutex.
   xSemaphoreTake(g_dev_mutex, portMAX_DELAY);
+  bool snap_dev_ready = __atomic_load_n(&g_dev_ready, __ATOMIC_ACQUIRE);
+  bool snap_dev_handle = g_dev != NULL;
+  uint32_t snap_generation = g_dev_generation;
+  uint8_t snap_usb_stage = g_usb_stage;
+  esp_err_t snap_usb_error = g_usb_last_error;
+  uint16_t snap_vid = g_usb_last_vid;
+  uint16_t snap_pid = g_usb_last_pid;
+  uint8_t snap_interface_count = g_usb_interface_count;
+  uint8_t snap_selected_interface = g_usb_selected_interface;
+  uint8_t snap_selected_class = g_usb_selected_class;
+  uint32_t snap_new_events = g_usb_new_events;
+  uint32_t snap_gone_events = g_usb_gone_events;
+  uint32_t snap_open_attempts = g_usb_open_attempts;
   bool snap_scan_done = g_rid_scan_done;
   uint8_t snap_desc_rids[64];
   uint8_t snap_rid_count = g_desc_rid_count;
@@ -939,11 +1097,72 @@ static void handle_diag() {
 
   char hex[8];
   String out;
-  out.reserve(768);
+  out.reserve(1500);
   out = "{\"poll_ok_mask\":\"0x";
   snprintf(hex, sizeof(hex), "%02lx", (unsigned long)snap_mask);
   out += hex;
-  out += "\",\"rid_scan_done\":";
+  out += "\",\"usb_stage\":\"";
+  out += usb_stage_str(snap_usb_stage);
+  out += "\",\"usb_last_error\":\"";
+  out += esp_err_to_name(snap_usb_error);
+  out += "\",\"device_ready\":";
+  out += snap_dev_ready ? "true" : "false";
+  out += ",\"device_handle\":";
+  out += snap_dev_handle ? "true" : "false";
+  out += ",\"device_generation\":";
+  out += snap_generation;
+  out += ",\"new_device_events\":";
+  out += snap_new_events;
+  out += ",\"gone_device_events\":";
+  out += snap_gone_events;
+  out += ",\"open_attempts\":";
+  out += snap_open_attempts;
+  out += ",\"last_vid\":\"0x";
+  snprintf(hex, sizeof(hex), "%04x", snap_vid);
+  out += hex;
+  out += "\",\"last_pid\":\"0x";
+  snprintf(hex, sizeof(hex), "%04x", snap_pid);
+  out += hex;
+  out += "\",\"interface_count\":";
+  out += snap_interface_count;
+  out += ",\"selected_interface\":";
+  out += snap_selected_interface;
+  out += ",\"selected_class\":\"0x";
+  snprintf(hex, sizeof(hex), "%02x", snap_selected_class);
+  out += hex;
+  out += "\",\"transfer_in_flight\":";
+  out += __atomic_load_n(&g_xfer_in_flight, __ATOMIC_ACQUIRE) ? "true" : "false";
+  out += ",\"transfer_last_submit_error\":\"";
+  out += esp_err_to_name((esp_err_t)__atomic_load_n(&g_xfer_last_submit_result, __ATOMIC_ACQUIRE));
+  out += "\",\"transfer_last_status\":";
+  out += __atomic_load_n(&g_xfer_last_status, __ATOMIC_ACQUIRE);
+  out += ",\"transfer_submits\":";
+  out += __atomic_load_n(&g_xfer_submit_count, __ATOMIC_RELAXED);
+  out += ",\"transfer_callbacks\":";
+  out += __atomic_load_n(&g_xfer_callback_count, __ATOMIC_RELAXED);
+  out += ",\"transfer_timeouts\":";
+  out += __atomic_load_n(&g_xfer_timeout_count, __ATOMIC_RELAXED);
+  out += ",\"usb_task_loops\":";
+  out += __atomic_load_n(&g_usb_task_loops, __ATOMIC_RELAXED);
+  out += ",\"usb_library_devices\":";
+  out += __atomic_load_n(&g_usb_library_device_count, __ATOMIC_ACQUIRE);
+  out += ",\"usb_last_library_result\":\"";
+  out += esp_err_to_name((esp_err_t)__atomic_load_n(&g_usb_last_lib_result, __ATOMIC_ACQUIRE));
+  out += "\",\"usb_last_client_result\":\"";
+  out += esp_err_to_name((esp_err_t)__atomic_load_n(&g_usb_last_client_result, __ATOMIC_ACQUIRE));
+  out += "\",\"compiled_usb_mode\":";
+#ifdef ARDUINO_USB_MODE
+  out += ARDUINO_USB_MODE;
+#else
+  out += -1;
+#endif
+  out += ",\"compiled_cdc_on_boot\":";
+#ifdef ARDUINO_USB_CDC_ON_BOOT
+  out += ARDUINO_USB_CDC_ON_BOOT;
+#else
+  out += -1;
+#endif
+  out += ",\"rid_scan_done\":";
   out += snap_scan_done ? "true" : "false";
   out += ",\"descriptor_rids\":[";
   for (uint8_t i = 0; i < snap_rid_count; i++) {
